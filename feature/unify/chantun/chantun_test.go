@@ -240,3 +240,20 @@ done:
 		}
 	}
 }
+
+// Review focus: on a closed device with room in its buffers, select would
+// pick at random between done and the send, so Inject and Write sometimes
+// succeeded after Close.
+func TestInjectWriteAfterCloseOnBufferedDevice(t *testing.T) {
+	const n = 64
+	d := newDev(t, 1, 2*n)
+	d.Close()
+	for i := range n {
+		if err := d.Inject(context.Background(), []byte("x")); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("Inject #%d after Close = %v, want os.ErrClosed", i, err)
+		}
+		if got, err := d.Write([][]byte{[]byte("x")}, 0); got != 0 || !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("Write #%d after Close = %d, %v; want 0, os.ErrClosed", i, got, err)
+		}
+	}
+}

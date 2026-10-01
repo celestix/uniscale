@@ -59,8 +59,12 @@ func New(name string, mtu, batch, depth int) (*Device, error) {
 }
 
 // Inject queues pkt for the stack to read. It takes ownership of pkt and
-// blocks until there is room, ctx is done, or the device is closed.
+// blocks until there is room, ctx is done, or the device is closed. It
+// returns os.ErrClosed once the device is closed, even if there is room.
 func (d *Device) Inject(ctx context.Context, pkt []byte) error {
+	if d.closedNow() {
+		return os.ErrClosed
+	}
 	select {
 	case <-d.done:
 		return os.ErrClosed
@@ -141,11 +145,15 @@ func (d *Device) Read(slab []byte, packets []tun.ReadPacket) (int, error) {
 }
 
 // Write implements tun.Device. It copies each packet (from offset) and
-// blocks until the loop has room or the device is closed.
+// blocks until the loop has room or the device is closed. It returns
+// os.ErrClosed once the device is closed, even if there is room.
 func (d *Device) Write(bufs [][]byte, offset int) (int, error) {
 	for i, b := range bufs {
 		if offset < 0 || offset > len(b) {
 			return i, errors.New("chantun: offset out of range")
+		}
+		if d.closedNow() {
+			return i, os.ErrClosed
 		}
 		p := bytes.Clone(b[offset:])
 		select {
@@ -155,6 +163,18 @@ func (d *Device) Write(bufs [][]byte, offset int) (int, error) {
 		}
 	}
 	return len(bufs), nil
+}
+
+// closedNow reports whether the device is closed, without blocking. A
+// select with a ready send and a closed done picks either at random, so
+// senders check this first.
+func (d *Device) closedNow() bool {
+	select {
+	case <-d.done:
+		return true
+	default:
+		return false
+	}
 }
 
 // MTU implements tun.Device.
