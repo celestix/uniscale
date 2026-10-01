@@ -75,6 +75,15 @@ check: staticcheck vet depaware buildwindows build386 buildlinuxarm buildwasm ##
 staticcheck: ## Run staticcheck.io checks
 	./tool/go run honnef.co/go/tools/cmd/staticcheck -- $$(./tool/go run ./tool/listpkgs --ignore-3p  ./...)
 
+UNIFY_COVER_MIN ?= 95
+unify-cover: ## Fail if any feature/unify package has under $(UNIFY_COVER_MIN)% test coverage
+	@./tool/go test -cover ./feature/unify/... | awk -v min=$(UNIFY_COVER_MIN) ' \
+		/no test files/ { print "missing tests: " $$0; bad = 1; next } \
+		/coverage:/ { pct = $$0; sub(/.*coverage: /, "", pct); sub(/%.*/, "", pct); \
+			if (pct + 0 < min) { print "below " min "%: " $$0; bad = 1 } else { print } next } \
+		{ print; bad = 1 } \
+		END { exit bad }'
+
 kube-generate-all: kube-generate-deepcopy ## Refresh generated files for Tailscale Kubernetes Operator
 	./tool/go generate ./cmd/k8s-operator
 

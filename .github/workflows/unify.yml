@@ -1,0 +1,33 @@
+name: unify
+
+on:
+  push:
+    branches:
+      - unification
+    paths:
+      - "feature/unify/**"
+      - ".github/workflows/unify.yml"
+  pull_request:
+    paths:
+      - "feature/unify/**"
+      - ".github/workflows/unify.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Race tests
+        run: ./tool/go test -race ./feature/unify/...
+      - name: Coverage gate
+        run: make unify-cover
