@@ -48,7 +48,7 @@ func TestMetadata(t *testing.T) {
 		t.Errorf("first event = %v, want EventUp", e)
 	}
 	d.SetMTU(1200)
-	d.SetMTU(1100) // second update coalesces while the first is pending
+	d.SetMTU(1100) // a second update before the stack reads events
 	if e := <-d.Events(); e != tun.EventMTUUpdate {
 		t.Errorf("event = %v, want EventMTUUpdate", e)
 	}
@@ -202,5 +202,41 @@ func TestInjectContextCanceled(t *testing.T) {
 	cancel()
 	if err := d.Inject(ctx, []byte("x")); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Inject = %v, want context.Canceled", err)
+	}
+}
+
+func TestSetMTUNeverBlocks(t *testing.T) {
+	d := newDev(t, 1, 1)
+	// Call SetMTU many times without reading Events(); SetMTU must not block.
+	// With a buffer of 4, some updates will be dropped, but all calls return.
+	for i := 0; i < 10; i++ {
+		d.SetMTU(1000 + i) // calls with values 1000..1009
+	}
+	// The latest MTU value is always accessible.
+	if m, _ := d.MTU(); m != 1009 {
+		t.Fatalf("MTU = %d, want 1009", m)
+	}
+	// Drain events non-blockingly and verify overflow behavior.
+	var events []tun.Event
+	for {
+		select {
+		case e := <-d.Events():
+			events = append(events, e)
+		default:
+			goto done
+		}
+	}
+done:
+	// Should have EventUp plus some (but not all) EventMTUUpdate calls.
+	if len(events) < 1 || len(events) > 4 {
+		t.Fatalf("drained %d events, want 1..4", len(events))
+	}
+	if events[0] != tun.EventUp {
+		t.Errorf("first event = %v, want EventUp", events[0])
+	}
+	for _, e := range events[1:] {
+		if e != tun.EventMTUUpdate {
+			t.Errorf("event = %v, want EventMTUUpdate", e)
+		}
 	}
 }

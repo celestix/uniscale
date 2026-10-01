@@ -88,7 +88,7 @@ func (d *Device) SetMTU(mtu int) {
 	}
 	select {
 	case d.events <- tun.EventMTUUpdate:
-	default: // an update is already pending; the stack reads MTU() then
+	default: // event buffer full; update is dropped but MTU() still returns the latest value
 	}
 }
 
