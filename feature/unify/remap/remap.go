@@ -154,8 +154,10 @@ type Table struct {
 }
 
 // New returns a table configured by cfg and loaded from store. store may be
-// nil for a table that is not persisted. Unreadable saved state is moved
-// aside with [Store.Discard] and the table starts empty; see [Table.LoadErr].
+// nil for a table that is not persisted. Saved state that cannot be decoded
+// or is invalid is moved aside with [Store.Discard] and the table starts
+// empty; see [Table.LoadErr]. An error reading the store (other than
+// nothing having been saved) is returned, and nothing is discarded.
 func New(cfg Config, store Store) (*Table, error) {
 	cfg = cfg.withDefaults()
 	if err := cfg.validate(); err != nil {
@@ -169,7 +171,10 @@ func New(cfg Config, store Store) (*Table, error) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	saved := t.loadLocked()
+	saved, err := t.loadLocked()
+	if err != nil {
+		return nil, err
+	}
 	if !t.cfg.Pool6.IsValid() {
 		t.cfg.Pool6 = saved
 	}
@@ -187,25 +192,27 @@ func New(cfg Config, store Store) (*Table, error) {
 	return t, nil
 }
 
-// loadLocked loads saved state and returns the saved Pool6, if any.
-func (t *Table) loadLocked() netip.Prefix {
+// loadLocked loads saved state and returns the saved Pool6, if any. Only
+// state that cannot be decoded or is invalid is discarded; an error reading
+// the store is returned.
+func (t *Table) loadLocked() (netip.Prefix, error) {
 	if t.store == nil {
-		return netip.Prefix{}
+		return netip.Prefix{}, nil
 	}
 	b, err := t.store.Load()
 	if errors.Is(err, fs.ErrNotExist) {
-		return netip.Prefix{}
-	}
-	var st state
-	if err == nil {
-		st, err = decodeState(b)
+		return netip.Prefix{}, nil
 	}
 	if err != nil {
-		t.loadErr = fmt.Errorf("remap: discarded unreadable state: %w", err)
+		return netip.Prefix{}, fmt.Errorf("remap: loading state: %w", err)
+	}
+	st, err := decodeState(b)
+	if err != nil {
+		t.loadErr = fmt.Errorf("remap: discarded saved state: %w", err)
 		if derr := t.store.Discard(t.cfg.Now()); derr != nil {
 			t.loadErr = errors.Join(t.loadErr, derr)
 		}
-		return netip.Prefix{}
+		return netip.Prefix{}, nil
 	}
 	for _, m := range st.Mappings {
 		t.mappings[key{m.Owner, m.Real}] = m
@@ -213,7 +220,7 @@ func (t *Table) loadLocked() netip.Prefix {
 	for _, q := range st.Quarantine {
 		t.quarantine[q.Virtual] = released{key{q.Owner, q.Real}, q.Until}
 	}
-	return st.Pool6
+	return st.Pool6, nil
 }
 
 // LoadErr returns the error that made [New] discard saved state, or nil.

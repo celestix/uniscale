@@ -20,7 +20,8 @@ type Store interface {
 	Load() ([]byte, error)
 	// Save atomically replaces the saved state.
 	Save([]byte) error
-	// Discard moves unreadable saved state aside so it can be inspected.
+	// Discard moves saved state that cannot be decoded aside so it can be
+	// inspected.
 	Discard(now time.Time) error
 }
 

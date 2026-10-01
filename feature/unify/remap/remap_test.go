@@ -634,11 +634,22 @@ func TestCorruptStateDiscarded(t *testing.T) {
 		mustSync(t, tb, "p", t0, "100.70.2.9/32")
 		wantVirtual(t, tb, "p", "100.70.2.9", "198.18.0.0")
 	})
-	t.Run("load error and discard error", func(t *testing.T) {
-		st := &memStore{loadErr: errors.New("io"), discardErr: errors.New("rename")}
+	t.Run("load error", func(t *testing.T) {
+		// An I/O error says nothing about the saved state: keep it, and
+		// fail instead of starting with an empty table.
+		st := &memStore{data: []byte(good), loadErr: errors.New("io")}
+		if _, err := New(testConfig(), st); err == nil || !strings.Contains(err.Error(), "io") {
+			t.Fatalf("New = %v, want the load error", err)
+		}
+		if st.discarded {
+			t.Fatal("state discarded after a load I/O error")
+		}
+	})
+	t.Run("discard error", func(t *testing.T) {
+		st := &memStore{data: []byte(`{`), discardErr: errors.New("rename")}
 		tb := newTable(t, testConfig(), st)
 		err := tb.LoadErr()
-		if err == nil || !strings.Contains(err.Error(), "io") || !strings.Contains(err.Error(), "rename") {
+		if err == nil || !strings.Contains(err.Error(), "invalid saved state") || !strings.Contains(err.Error(), "rename") {
 			t.Fatalf("LoadErr = %v, want both errors", err)
 		}
 	})
