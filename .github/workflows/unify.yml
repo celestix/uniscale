@@ -6,10 +6,18 @@ on:
       - unification
     paths:
       - "feature/unify/**"
+      - "net/packet/**"
+      - "Makefile"
+      - "go.mod"
+      - "go.sum"
       - ".github/workflows/unify.yml"
   pull_request:
     paths:
       - "feature/unify/**"
+      - "net/packet/**"
+      - "Makefile"
+      - "go.mod"
+      - "go.sum"
       - ".github/workflows/unify.yml"
 
 permissions:
