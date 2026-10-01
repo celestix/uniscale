@@ -78,7 +78,7 @@ staticcheck: ## Run staticcheck.io checks
 UNIFY_COVER_MIN ?= 95
 unify-cover: ## Fail if a feature/unify package fails its tests or is under UNIFY_COVER_MIN (default 95) percent coverage
 	@out=$$(./tool/go test -cover ./feature/unify/...); status=$$?; \
-	echo "$$out" | awk -v min=$(UNIFY_COVER_MIN) ' \
+	printf '%s\n' "$$out" | awk -v min=$(UNIFY_COVER_MIN) ' \
 		/no test files/ { print "missing tests: " $$0; bad = 1; next } \
 		/coverage:/ { pct = $$0; sub(/.*coverage: /, "", pct); sub(/%.*/, "", pct); \
 			if (pct + 0 < min) { print "below " min "%: " $$0; bad = 1 } else { print } next } \
