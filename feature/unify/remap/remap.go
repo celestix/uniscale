@@ -434,8 +434,9 @@ func (t *Table) reclaimLocked(k key, v netip.Prefix, now time.Time) bool {
 //
 // Run it after the live owners have synced: a prefix that is still present
 // but has not been synced for longer than the GC interval expires too. If
-// it returns while its block is quarantined it takes the same block back
-// (see [Table.Sync]), but it loses the block once the quarantine ends.
+// it is synced again while its block is quarantined it takes the same block
+// back (see [Table.Sync]); after the quarantine it is mapped as if seen for
+// the first time.
 func (t *Table) Expire(now time.Time) (Changes, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
