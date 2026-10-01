@@ -11,6 +11,7 @@
 package xlate
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -239,15 +240,28 @@ func (t *Translator) inboundDst(st Stack, dst netip.Addr) (netip.Addr, bool) {
 }
 
 // wellFormed reports whether q is an IPv4 or IPv6 packet whose addresses
-// can be rewritten safely. packet.Decode accepts IPv4 header lengths below
-// 20 bytes, which would point the transport checksum offsets used by
-// net/packet/checksum into the IP header itself.
+// can be rewritten safely. It checks the IP header itself instead of
+// trusting q: packet.Decode accepts IPv4 header lengths below 20 bytes
+// (which would point the transport checksum offsets used by
+// net/packet/checksum into the IP header), and returns before setting the
+// addresses of a packet shorter than its IP length, leaving a reused Parsed
+// with the previous packet's addresses.
 func wellFormed(q *packet.Parsed) bool {
+	b := q.Buffer()
 	switch q.IPVersion {
 	case 4:
-		return q.Buffer()[0]&0x0f >= 5
+		if len(b) < 20 {
+			return false
+		}
+		ihl := int(b[0]&0x0f) * 4
+		total := int(binary.BigEndian.Uint16(b[2:4]))
+		return ihl >= 20 && ihl <= total && total <= len(b) &&
+			q.Src.Addr() == netip.AddrFrom4([4]byte(b[12:16])) &&
+			q.Dst.Addr() == netip.AddrFrom4([4]byte(b[16:20]))
 	case 6:
-		return true
+		return len(b) >= 40 && 40+int(binary.BigEndian.Uint16(b[4:6])) <= len(b) &&
+			q.Src.Addr() == netip.AddrFrom16([16]byte(b[8:24])) &&
+			q.Dst.Addr() == netip.AddrFrom16([16]byte(b[24:40]))
 	}
 	return false
 }

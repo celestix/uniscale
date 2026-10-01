@@ -108,7 +108,13 @@ func TestMalformedICMPErrors(t *testing.T) {
 	t.Run("ip length past buffer", func(t *testing.T) {
 		b := icmpErr("100.99.0.1", "198.18.0.1", orig)
 		b[3] = 0xff
-		tr.Outbound(parse(b)) // must not panic
+		before := string(b)
+		if r := tr.Outbound(parse(b)); r.Verdict != Drop || r.Reason != "malformed packet" {
+			t.Fatalf("Outbound = %+v, want drop: malformed packet", r)
+		}
+		if string(b) != before {
+			t.Fatal("dropped packet was modified")
+		}
 	})
 	t.Run("ipv6 fragment header past ip length", func(t *testing.T) {
 		// An atomic fragment header whose IP payload length ends inside

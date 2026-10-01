@@ -4,12 +4,14 @@
 package xlate
 
 import (
+	"encoding/binary"
 	"net/netip"
 	"strings"
 	"testing"
 	"time"
 
 	"tailscale.com/feature/unify/remap"
+	"tailscale.com/net/packet"
 	"tailscale.com/types/ipproto"
 )
 
@@ -255,6 +257,109 @@ func TestShortIPv4HeaderDropped(t *testing.T) {
 	}
 	if string(b) != orig {
 		t.Fatal("malformed packet was modified")
+	}
+}
+
+// Review focus: packet.Decode stops before setting the addresses of a
+// packet shorter than its header says, so a reused Parsed (the packet loop
+// reuses one) still holds the previous packet's addresses.
+func TestStaleParsedDropped(t *testing.T) {
+	tr := scenario(t)
+	cases := []struct {
+		name         string
+		owner        remap.Owner // "" for Outbound
+		valid, stale []byte
+	}{
+		{"ipv4 outbound", "", pkt(ipproto.TCP, "100.101.5.2:4000", "100.88.1.4:22"), pkt(ipproto.TCP, "9.9.9.9:1", "8.8.4.4:2")},
+		{"ipv4 inbound", "friends", pkt(ipproto.UDP, "100.88.1.4:4000", "100.99.0.1:53"), pkt(ipproto.UDP, "9.9.9.9:1", "8.8.4.4:2")},
+		{"ipv6 outbound", "", pkt(ipproto.TCP, "[fd7a:115c:a1e0::52]:4000", "[fd7a:115c:a1e0::99]:22"), pkt(ipproto.TCP, "[2001:db8::9]:1", "[2001:db8::8]:2")},
+		{"ipv6 inbound", "work", pkt(ipproto.UDP, "[fd7a:115c:a1e0::99]:4000", "[fd7a:115c:a1e0::52]:53"), pkt(ipproto.UDP, "[2001:db8::9]:1", "[2001:db8::8]:2")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			translate := func(q *packet.Parsed) Result {
+				if c.owner == "" {
+					return tr.Outbound(q)
+				}
+				return tr.Inbound(c.owner, q)
+			}
+			var q packet.Parsed
+			q.Decode(c.valid)
+			if r := translate(&q); r.Verdict == Drop {
+				t.Fatalf("valid packet dropped: %s", r.Reason)
+			}
+			b := c.stale[:len(c.stale)-3] // shorter than its IP length
+			orig := string(b)
+			q.Decode(b)
+			if r := translate(&q); r.Verdict != Drop || r.Reason != "malformed packet" {
+				t.Fatalf("truncated packet = %+v, want drop: malformed packet", r)
+			}
+			if string(b) != orig {
+				t.Fatal("malformed packet was modified")
+			}
+		})
+	}
+}
+
+// wellFormed checks the IP header itself rather than trusting what
+// packet.Decode left in Parsed.
+func TestMalformedIPHeadersDropped(t *testing.T) {
+	tr := scenario(t)
+	v4 := func() []byte { return pkt(ipproto.UDP, "198.18.0.0:4000", "198.19.3.4:53") }
+	v6 := func() []byte { return pkt(ipproto.UDP, "[fd7a:115c:a1e0::77]:4000", "[fd00:1::]:53") }
+	setLen := func(b []byte, off int, n uint16) []byte { binary.BigEndian.PutUint16(b[off:], n); return b }
+	cases := map[string]func() ([]byte, *packet.Parsed){
+		"ipv4 total length past buffer": func() ([]byte, *packet.Parsed) {
+			b := setLen(v4(), 2, 200)
+			return b, parse(b)
+		},
+		"ipv4 total length inside header": func() ([]byte, *packet.Parsed) {
+			b := setLen(v4(), 2, 16)
+			return b, parse(b)
+		},
+		"ipv6 payload past buffer": func() ([]byte, *packet.Parsed) {
+			b := setLen(v6(), 4, 200)
+			return b, parse(b)
+		},
+		"ipv4 header source differs from Parsed": func() ([]byte, *packet.Parsed) {
+			b := v4()
+			q := parse(b)
+			b[12] = 10
+			return b, q
+		},
+		"ipv4 header destination differs from Parsed": func() ([]byte, *packet.Parsed) {
+			b := v4()
+			q := parse(b)
+			b[19] = 9
+			return b, q
+		},
+		"ipv6 header source differs from Parsed": func() ([]byte, *packet.Parsed) {
+			b := v6()
+			q := parse(b)
+			b[23] = 0x76
+			return b, q
+		},
+		"ipv6 header destination differs from Parsed": func() ([]byte, *packet.Parsed) {
+			b := v6()
+			q := parse(b)
+			b[39] = 9
+			return b, q
+		},
+		// Not produced by Decode; wellFormed must not index past the buffer.
+		"ipv4 Parsed without buffer": func() ([]byte, *packet.Parsed) { return nil, &packet.Parsed{IPVersion: 4} },
+		"ipv6 Parsed without buffer": func() ([]byte, *packet.Parsed) { return nil, &packet.Parsed{IPVersion: 6} },
+	}
+	for name, mk := range cases {
+		t.Run(name, func(t *testing.T) {
+			b, q := mk()
+			orig := string(b)
+			if r := tr.Outbound(q); r.Verdict != Drop || r.Reason != "malformed packet" {
+				t.Fatalf("Outbound = %+v, want drop: malformed packet", r)
+			}
+			if string(b) != orig {
+				t.Fatal("malformed packet was modified")
+			}
+		})
 	}
 }
 
