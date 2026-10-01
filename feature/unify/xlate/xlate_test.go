@@ -4,6 +4,7 @@
 package xlate
 
 import (
+	"bytes"
 	"encoding/binary"
 	"net/netip"
 	"strings"
@@ -159,6 +160,8 @@ func TestOutbound(t *testing.T) {
 			verdict: ToStack, wantOwner: "friends", wantSrc: "8.8.8.8", wantDst: "100.88.1.4"},
 		{name: "LAN source to tailnet without that route", proto: ipproto.TCP, src: "192.168.50.7:22", dst: "100.70.2.10:4000",
 			verdict: Drop, wantReason: "source not allowed"},
+		{name: "icmpv6 echo to friends remapped ipv6 peer", proto: ipproto.ICMPv6, src: "[fd7a:115c:a1e0::77]:0", dst: "[fd00:1::]:0",
+			verdict: ToStack, wantOwner: "friends", wantSrc: "fd7a:115c:a1e0::77", wantDst: "fd7a:115c:a1e0::99"},
 	})
 }
 
@@ -194,6 +197,8 @@ func TestInbound(t *testing.T) {
 			verdict: Drop, wantReason: "destination not reachable"},
 		{name: "work ipv6 peer", owner: "work", proto: ipproto.UDP, src: "[fd7a:115c:a1e0::99]:4000", dst: "[fd7a:115c:a1e0::52]:53",
 			verdict: ToHost, wantOwner: "work", wantSrc: "fd7a:115c:a1e0::99", wantDst: "fd7a:115c:a1e0::52"},
+		{name: "icmpv6 echo from friends remapped ipv6 peer", owner: "friends", proto: ipproto.ICMPv6, src: "[fd7a:115c:a1e0::99]:0", dst: "[fd7a:115c:a1e0::77]:0",
+			verdict: ToHost, wantOwner: "friends", wantSrc: "fd00:1::", wantDst: "fd7a:115c:a1e0::77"},
 
 		// Replies from the internet through the exit node this host uses.
 		{name: "tcp reply via personal exit node", owner: "personal", proto: ipproto.TCP, src: "1.1.1.1:443", dst: "100.70.2.9:4000",
@@ -536,6 +541,59 @@ func TestIPv4UDPZeroChecksumKept(t *testing.T) {
 			}
 			if !checksumsOK(c.b) {
 				t.Fatal("bad checksums after translation")
+			}
+		})
+	}
+}
+
+// Spec section 11: IPv4 fragments through a remapped flow. The first
+// fragment is translated like a whole packet; its UDP checksum covers the
+// whole datagram and must be valid after reassembly. Later fragments only
+// get their IP header rewritten.
+func TestIPv4FragmentsRemapped(t *testing.T) {
+	tr := scenario(t)
+	payload := bytes.Repeat([]byte("0123456789abcdef"), 8)
+	cases := []struct {
+		name             string
+		owner            remap.Owner // "" for Outbound
+		src, dst         string
+		wantSrc, wantDst string
+	}{
+		{"outbound", "", "198.18.0.0:4000", "198.19.3.4:53", "100.70.2.9", "10.10.3.4"},
+		{"inbound", "personal", "10.10.3.4:53", "100.70.2.9:4000", "198.19.3.4", "198.18.0.0"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, d := netip.MustParseAddrPort(c.src), netip.MustParseAddrPort(c.dst)
+			body, off := l4(ipproto.UDP, s, d, payload)
+			first, rest := fragment4(ipWrap(ipproto.UDP, s.Addr(), d.Addr(), body, off), 80)
+			if q := parse(rest); q.IPProto != ipproto.Fragment {
+				t.Fatalf("second fragment decodes as %v, want a non-first fragment", q.IPProto)
+			}
+			restPayload := bytes.Clone(rest[20:])
+			for _, b := range [][]byte{first, rest} {
+				var r Result
+				if c.owner == "" {
+					r = tr.Outbound(parse(b))
+				} else {
+					r = tr.Inbound(c.owner, parse(b))
+				}
+				if r.Verdict == Drop || r.Owner != "personal" {
+					t.Fatalf("translate = %+v", r)
+				}
+				if s, d := addrs(b); s != mpa(c.wantSrc) || d != mpa(c.wantDst) {
+					t.Fatalf("addresses = %v -> %v, want %s -> %s", s, d, c.wantSrc, c.wantDst)
+				}
+				if !checksumsOK(b) {
+					t.Fatal("bad IPv4 header checksum")
+				}
+			}
+			if !bytes.Equal(rest[20:], restPayload) {
+				t.Fatal("non-first fragment payload modified")
+			}
+			udp := append(bytes.Clone(first[20:]), rest[20:]...)
+			if csum(pseudo(mpa(c.wantSrc), mpa(c.wantDst), ipproto.UDP, len(udp)), udp) != 0 {
+				t.Fatal("reassembled UDP checksum invalid")
 			}
 		})
 	}
