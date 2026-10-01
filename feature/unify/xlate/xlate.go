@@ -230,9 +230,9 @@ func containsAddr(ps []netip.Prefix, a netip.Addr) bool {
 	return false
 }
 
-// rewrite replaces q's addresses and fixes checksums. It reports false,
-// leaving q unchanged, if a new address is from a different family than
-// the packet.
+// rewrite replaces q's addresses and fixes checksums, including the
+// embedded packet of ICMP errors. It reports false, leaving q unchanged, if
+// a new address is from a different family than the packet.
 func rewrite(q *packet.Parsed, oldSrc, newSrc, oldDst, newDst netip.Addr) bool {
 	is4 := q.IPVersion == 4
 	if newSrc.Is4() != is4 || newDst.Is4() != is4 {
@@ -243,6 +243,9 @@ func rewrite(q *packet.Parsed, oldSrc, newSrc, oldDst, newDst netip.Addr) bool {
 	}
 	if newDst != oldDst {
 		checksum.UpdateDstAddr(q, newDst)
+	}
+	if q.IsError() && (newSrc != oldSrc || newDst != oldDst) {
+		rewriteICMPError(q, oldSrc, newSrc, oldDst, newDst)
 	}
 	return true
 }
