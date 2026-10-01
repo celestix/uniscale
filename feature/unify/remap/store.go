@@ -34,8 +34,12 @@ type state struct {
 	Quarantine []quarantined `json:"quarantine,omitempty"`
 }
 
+// quarantined is a released virtual block, with the (owner, real prefix)
+// that held it.
 type quarantined struct {
 	Virtual netip.Prefix `json:"virtual"`
+	Owner   Owner        `json:"owner"`
+	Real    netip.Prefix `json:"real"`
 	Until   time.Time    `json:"until"`
 }
 
@@ -50,7 +54,7 @@ func decodeState(b []byte) (state, error) {
 	if st.Version != stateVersion {
 		return state{}, fmt.Errorf("%w: version %d, want %d", errCorrupt, st.Version, stateVersion)
 	}
-	if st.Pool6.IsValid() && (!st.Pool6.Addr().Is6() || st.Pool6 != st.Pool6.Masked()) {
+	if st.Pool6.IsValid() && (!st.Pool6.Addr().Is6() || st.Pool6.Addr().Is4In6() || st.Pool6 != st.Pool6.Masked()) {
 		return state{}, fmt.Errorf("%w: bad pool6 %v", errCorrupt, st.Pool6)
 	}
 	for _, m := range st.Mappings {
@@ -62,8 +66,9 @@ func decodeState(b []byte) (state, error) {
 		return state{}, fmt.Errorf("%w: %v", errCorrupt, err)
 	}
 	for _, q := range st.Quarantine {
-		if !q.Virtual.IsValid() || q.Virtual != q.Virtual.Masked() {
-			return state{}, fmt.Errorf("%w: bad quarantined prefix %v", errCorrupt, q.Virtual)
+		m := Mapping{Owner: q.Owner, Real: q.Real, Virtual: q.Virtual}
+		if err := m.check(); err != nil {
+			return state{}, fmt.Errorf("%w: quarantined %v", errCorrupt, err)
 		}
 	}
 	return st, nil

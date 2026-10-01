@@ -319,6 +319,166 @@ func TestRemoveOwner(t *testing.T) {
 	}
 }
 
+// Review focus: quarantine exists so a released block cannot point to a
+// different peer. The (owner, real) that held it may take it back while it
+// is quarantined; anyone else is still kept out (R4: remap only on
+// collision).
+func TestQuarantineReclaim(t *testing.T) {
+	cfg := testConfig()
+	cfg.GCAfter = time.Hour
+	cfg.Quarantine = 2 * time.Hour
+	expire := func(t *testing.T, tb *Table, now time.Time, want int) {
+		t.Helper()
+		ch, err := tb.Expire(now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(ch.Removed) != want {
+			t.Fatalf("Expire removed %v, want %d mappings", ch.Removed, want)
+		}
+	}
+	t.Run("identity after expiry", func(t *testing.T) {
+		tb := newTable(t, cfg, &memStore{})
+		mustSync(t, tb, "work", t0, "100.70.2.9/32")
+		expire(t, tb, t0.Add(90*time.Minute), 1)
+		mustSync(t, tb, "work", t0.Add(100*time.Minute), "100.70.2.9/32")
+		wantVirtual(t, tb, "work", "100.70.2.9", "100.70.2.9")
+	})
+	t.Run("remapped after expiry", func(t *testing.T) {
+		tb := newTable(t, cfg, &memStore{})
+		mustSync(t, tb, "work", t0, "100.70.2.9/32")
+		mustSync(t, tb, "personal", t0, "100.70.2.9/32") // -> 198.18.0.0
+		mustSync(t, tb, "work", t0.Add(30*time.Minute), "100.70.2.9/32")
+		expire(t, tb, t0.Add(90*time.Minute), 1) // personal only
+		mustSync(t, tb, "personal", t0.Add(100*time.Minute), "100.70.2.9/32")
+		wantVirtual(t, tb, "personal", "100.70.2.9", "198.18.0.0")
+	})
+	t.Run("identity after RemoveOwner", func(t *testing.T) {
+		tb := newTable(t, cfg, &memStore{})
+		mustSync(t, tb, "work", t0, "100.70.2.9/32", "10.0.0.0/24")
+		if _, err := tb.RemoveOwner("work", t0); err != nil {
+			t.Fatal(err)
+		}
+		mustSync(t, tb, "work", t0.Add(time.Minute), "100.70.2.9/32", "10.0.0.0/24")
+		wantVirtual(t, tb, "work", "100.70.2.9", "100.70.2.9")
+		wantVirtual(t, tb, "work", "10.0.0.7", "10.0.0.7")
+	})
+	t.Run("other owner still blocked, then owner returns", func(t *testing.T) {
+		tb := newTable(t, cfg, &memStore{})
+		mustSync(t, tb, "work", t0, "100.70.2.9/32")
+		tb.RemoveOwner("work", t0)
+		mustSync(t, tb, "personal", t0, "100.70.2.9/32")
+		wantVirtual(t, tb, "personal", "100.70.2.9", "198.18.0.0")
+		mustSync(t, tb, "work", t0, "100.70.2.9/32")
+		wantVirtual(t, tb, "work", "100.70.2.9", "100.70.2.9")
+	})
+	t.Run("other owner kept out of quarantined remapped block", func(t *testing.T) {
+		tb := newTable(t, cfg, &memStore{})
+		mustSync(t, tb, "work", t0, "100.70.2.9/32")
+		mustSync(t, tb, "personal", t0, "100.70.2.9/32") // -> 198.18.0.0
+		tb.RemoveOwner("personal", t0)
+		mustSync(t, tb, "friends", t0, "100.70.2.9/32")
+		wantVirtual(t, tb, "friends", "100.70.2.9", "198.18.0.1")
+		mustSync(t, tb, "personal", t0, "100.70.2.9/32")
+		wantVirtual(t, tb, "personal", "100.70.2.9", "198.18.0.0")
+	})
+	t.Run("same owner, other real prefix still blocked", func(t *testing.T) {
+		tb := newTable(t, cfg, &memStore{})
+		mustSync(t, tb, "work", t0, "10.0.0.0/24")
+		tb.RemoveOwner("work", t0)
+		mustSync(t, tb, "work", t0, "10.0.0.0/25")
+		wantVirtual(t, tb, "work", "10.0.0.7", "198.18.0.7")
+	})
+	t.Run("not reclaimed when no longer free", func(t *testing.T) {
+		tb := newTable(t, cfg, &memStore{})
+		mustSync(t, tb, "work", t0, "192.168.1.0/24")
+		tb.RemoveOwner("work", t0)
+		tb.SetLocal(prefixes("192.168.1.0/24"))
+		mustSync(t, tb, "work", t0, "192.168.1.0/24")
+		wantVirtual(t, tb, "work", "192.168.1.7", "198.18.0.7")
+	})
+	t.Run("reclaimed block leaves quarantine", func(t *testing.T) {
+		// Once taken back, the block is an ordinary identity mapping: the
+		// owner's nested identity prefixes may overlap it, in the same
+		// Sync or later.
+		tb := newTable(t, cfg, &memStore{})
+		mustSync(t, tb, "work", t0, "10.0.0.0/8")
+		tb.RemoveOwner("work", t0)
+		ch := mustSync(t, tb, "work", t0, "10.0.0.0/8", "10.1.0.0/16")
+		for _, m := range ch.Added {
+			if m.Remapped() {
+				t.Fatalf("%v remapped; want identity", m)
+			}
+		}
+		mustSync(t, tb, "work", t0, "10.0.0.0/8", "10.1.0.0/16", "10.2.0.0/16")
+		wantVirtual(t, tb, "work", "10.2.0.1", "10.2.0.1")
+		// Another owner is now blocked by the live mapping, as usual.
+		mustSync(t, tb, "personal", t0, "10.3.0.0/16")
+		wantVirtual(t, tb, "personal", "10.3.0.1", "198.18.0.1")
+	})
+	t.Run("most recent block is reclaimed", func(t *testing.T) {
+		// work's 10.0.0.0/24 is released twice while its first block is
+		// still quarantined: it takes back the block it held last.
+		tb := newTable(t, cfg, &memStore{})
+		mustSync(t, tb, "work", t0, "10.0.0.0/24")
+		tb.RemoveOwner("work", t0)
+		tb.SetLocal(prefixes("10.0.0.0/24"))
+		mustSync(t, tb, "work", t0.Add(time.Minute), "10.0.0.0/24") // -> 198.18.0.0/24
+		tb.RemoveOwner("work", t0.Add(time.Minute))
+		tb.SetLocal(nil)
+		mustSync(t, tb, "work", t0.Add(2*time.Minute), "10.0.0.0/24")
+		wantVirtual(t, tb, "work", "10.0.0.7", "198.18.0.7")
+	})
+	t.Run("blocks released at the same time", func(t *testing.T) {
+		// Both of work's blocks for 10.0.0.0/24 were released at t0; the
+		// choice must not depend on map iteration order.
+		for range 20 {
+			tb := newTable(t, cfg, &memStore{})
+			mustSync(t, tb, "work", t0, "10.0.0.0/24")
+			tb.RemoveOwner("work", t0)
+			tb.SetLocal(prefixes("10.0.0.0/24"))
+			mustSync(t, tb, "work", t0, "10.0.0.0/24") // -> 198.18.0.0/24
+			tb.RemoveOwner("work", t0)
+			tb.SetLocal(nil)
+			mustSync(t, tb, "work", t0, "10.0.0.0/24")
+			wantVirtual(t, tb, "work", "10.0.0.7", "10.0.0.7")
+		}
+	})
+	t.Run("never overlaps others, even from inconsistent saved state", func(t *testing.T) {
+		// Saved state the table itself would not produce: blocks
+		// quarantined for a overlap b's live mapping and c's quarantined
+		// block. Taking them back would break the disjoint virtual space.
+		until := t0.Add(time.Hour).Format(time.RFC3339)
+		st := &memStore{data: []byte(`{"version":1,` +
+			`"mappings":[{"owner":"b","real":"10.0.0.0/24","virtual":"10.0.0.0/24","lastSeen":"2026-10-01T12:00:00Z"}],` +
+			`"quarantine":[` +
+			`{"virtual":"10.0.0.0/24","owner":"a","real":"10.0.0.0/24","until":"` + until + `"},` +
+			`{"virtual":"10.0.1.0/24","owner":"a","real":"10.0.1.0/24","until":"` + until + `"},` +
+			`{"virtual":"10.0.1.0/25","owner":"c","real":"10.0.1.0/25","until":"` + until + `"}]}`)}
+		tb := newTable(t, cfg, st)
+		if err := tb.LoadErr(); err != nil {
+			t.Fatal(err)
+		}
+		mustSync(t, tb, "a", t0, "10.0.0.0/24", "10.0.1.0/24")
+		wantVirtual(t, tb, "a", "10.0.0.7", "198.18.0.7")
+		wantVirtual(t, tb, "a", "10.0.1.7", "198.18.1.7")
+		if err := checkDisjoint(tb.Mappings()); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("persisted with owner and real", func(t *testing.T) {
+		st := &memStore{}
+		tb := newTable(t, cfg, st)
+		mustSync(t, tb, "work", t0, "100.70.2.9/32")
+		tb.RemoveOwner("work", t0)
+		tb2 := newTable(t, cfg, st)
+		mustSync(t, tb2, "friends", t0, "100.70.2.9/32")
+		wantVirtual(t, tb2, "friends", "100.70.2.9", "198.18.0.0")
+		mustSync(t, tb2, "work", t0, "100.70.2.9/32")
+		wantVirtual(t, tb2, "work", "100.70.2.9", "100.70.2.9")
+	})
+}
+
 func TestPersistenceRoundTrip(t *testing.T) {
 	st := &memStore{}
 	cfg := testConfig()
@@ -422,21 +582,28 @@ func TestNewErrors(t *testing.T) {
 }
 
 func TestCorruptStateDiscarded(t *testing.T) {
-	good := `{"version":1,"mappings":[{"owner":"w","real":"10.0.0.0/24","virtual":"10.0.0.0/24","lastSeen":"2026-10-01T12:00:00Z"}]}`
+	good := `{"version":1,"mappings":[{"owner":"w","real":"10.0.0.0/24","virtual":"10.0.0.0/24","lastSeen":"2026-10-01T12:00:00Z"}],` +
+		`"quarantine":[{"virtual":"198.18.0.0/32","owner":"p","real":"100.70.2.9/32","until":"2026-10-02T12:00:00Z"}]}`
 	bad := map[string]string{
-		"not json":           `{`,
-		"wrong version":      `{"version":2,"mappings":[]}`,
-		"bad pool6":          `{"version":1,"pool6":"10.0.0.0/8","mappings":[]}`,
-		"empty owner":        `{"version":1,"mappings":[{"owner":"","real":"10.0.0.0/24","virtual":"10.0.0.0/24"}]}`,
-		"invalid prefix":     `{"version":1,"mappings":[{"owner":"w","real":"10.0.0.0/24"}]}`,
-		"unmasked":           `{"version":1,"mappings":[{"owner":"w","real":"10.0.0.1/24","virtual":"10.0.0.0/24"}]}`,
-		"length mismatch":    `{"version":1,"mappings":[{"owner":"w","real":"10.0.0.0/24","virtual":"10.0.0.0/25"}]}`,
-		"default route":      `{"version":1,"mappings":[{"owner":"w","real":"0.0.0.0/0","virtual":"0.0.0.0/0"}]}`,
-		"duplicate":          `{"version":1,"mappings":[{"owner":"w","real":"10.0.0.0/24","virtual":"10.0.0.0/24"},{"owner":"w","real":"10.0.0.0/24","virtual":"198.18.0.0/24"}]}`,
-		"overlap owners":     `{"version":1,"mappings":[{"owner":"w","real":"10.0.0.0/24","virtual":"10.0.0.0/24"},{"owner":"p","real":"10.0.0.0/16","virtual":"10.0.0.0/16"}]}`,
-		"bad quarantine":     `{"version":1,"mappings":[],"quarantine":[{"virtual":"10.0.0.1/24","until":"2026-10-01T12:00:00Z"}]}`,
-		"overlap remapped":   `{"version":1,"mappings":[{"owner":"w","real":"10.0.0.0/24","virtual":"198.18.0.0/24"},{"owner":"w","real":"198.18.0.0/16","virtual":"198.18.0.0/16"}]}`,
-		"overlap same exact": `{"version":1,"mappings":[{"owner":"w","real":"10.0.0.0/24","virtual":"10.0.0.0/24"},{"owner":"p","real":"10.0.0.0/24","virtual":"10.0.0.0/24"}]}`,
+		"not json":                   `{`,
+		"wrong version":              `{"version":2,"mappings":[]}`,
+		"bad pool6":                  `{"version":1,"pool6":"10.0.0.0/8","mappings":[]}`,
+		"empty owner":                `{"version":1,"mappings":[{"owner":"","real":"10.0.0.0/24","virtual":"10.0.0.0/24"}]}`,
+		"invalid prefix":             `{"version":1,"mappings":[{"owner":"w","real":"10.0.0.0/24"}]}`,
+		"unmasked":                   `{"version":1,"mappings":[{"owner":"w","real":"10.0.0.1/24","virtual":"10.0.0.0/24"}]}`,
+		"length mismatch":            `{"version":1,"mappings":[{"owner":"w","real":"10.0.0.0/24","virtual":"10.0.0.0/25"}]}`,
+		"default route":              `{"version":1,"mappings":[{"owner":"w","real":"0.0.0.0/0","virtual":"0.0.0.0/0"}]}`,
+		"duplicate":                  `{"version":1,"mappings":[{"owner":"w","real":"10.0.0.0/24","virtual":"10.0.0.0/24"},{"owner":"w","real":"10.0.0.0/24","virtual":"198.18.0.0/24"}]}`,
+		"overlap owners":             `{"version":1,"mappings":[{"owner":"w","real":"10.0.0.0/24","virtual":"10.0.0.0/24"},{"owner":"p","real":"10.0.0.0/16","virtual":"10.0.0.0/16"}]}`,
+		"bad quarantine":             `{"version":1,"mappings":[],"quarantine":[{"virtual":"10.0.0.1/24","owner":"w","real":"10.0.0.0/24","until":"2026-10-01T12:00:00Z"}]}`,
+		"quarantine no owner":        `{"version":1,"mappings":[],"quarantine":[{"virtual":"10.0.0.0/24","real":"10.0.0.0/24","until":"2026-10-01T12:00:00Z"}]}`,
+		"quarantine no real":         `{"version":1,"mappings":[],"quarantine":[{"virtual":"10.0.0.0/24","owner":"w","until":"2026-10-01T12:00:00Z"}]}`,
+		"quarantine unmasked real":   `{"version":1,"mappings":[],"quarantine":[{"virtual":"198.18.0.0/24","owner":"w","real":"10.0.0.1/24","until":"2026-10-01T12:00:00Z"}]}`,
+		"quarantine length mismatch": `{"version":1,"mappings":[],"quarantine":[{"virtual":"198.18.0.0/24","owner":"w","real":"10.0.0.0/25","until":"2026-10-01T12:00:00Z"}]}`,
+		"quarantine family mismatch": `{"version":1,"mappings":[],"quarantine":[{"virtual":"198.18.0.0/24","owner":"w","real":"fd00::/24","until":"2026-10-01T12:00:00Z"}]}`,
+		"4in6 pool6":                 `{"version":1,"pool6":"::ffff:10.0.0.0/104","mappings":[]}`,
+		"overlap remapped":           `{"version":1,"mappings":[{"owner":"w","real":"10.0.0.0/24","virtual":"198.18.0.0/24"},{"owner":"w","real":"198.18.0.0/16","virtual":"198.18.0.0/16"}]}`,
+		"overlap same exact":         `{"version":1,"mappings":[{"owner":"w","real":"10.0.0.0/24","virtual":"10.0.0.0/24"},{"owner":"p","real":"10.0.0.0/24","virtual":"10.0.0.0/24"}]}`,
 	}
 	for name, data := range bad {
 		t.Run(name, func(t *testing.T) {
@@ -459,6 +626,13 @@ func TestCorruptStateDiscarded(t *testing.T) {
 			t.Fatal(err)
 		}
 		wantVirtual(t, tb, "w", "10.0.0.5", "10.0.0.5")
+		// The quarantined block keeps others out and returns to p.
+		mustSync(t, tb, "x", t0, "198.18.0.0/32")
+		wantVirtual(t, tb, "x", "198.18.0.0", "198.18.0.1")
+		mustSync(t, tb, "w", t0, "100.70.2.9/32")
+		wantVirtual(t, tb, "w", "100.70.2.9", "100.70.2.9")
+		mustSync(t, tb, "p", t0, "100.70.2.9/32")
+		wantVirtual(t, tb, "p", "100.70.2.9", "198.18.0.0")
 	})
 	t.Run("load error and discard error", func(t *testing.T) {
 		st := &memStore{loadErr: errors.New("io"), discardErr: errors.New("rename")}

@@ -123,6 +123,13 @@ type key struct {
 	real  netip.Prefix
 }
 
+// released is a quarantined virtual block: the (owner, real prefix) that
+// held it, and when it may be reused by anyone else.
+type released struct {
+	key   key
+	until time.Time
+}
+
 // snapshot is an immutable lookup view, published after every change so
 // the packet path can read it without locks.
 type snapshot struct {
@@ -138,7 +145,7 @@ type Table struct {
 
 	mu         sync.Mutex
 	mappings   map[key]Mapping
-	quarantine map[netip.Prefix]time.Time // released virtual block -> reusable after
+	quarantine map[netip.Prefix]released // by released virtual block
 	local      []netip.Prefix
 	lastSave   time.Time
 	loadErr    error
@@ -158,7 +165,7 @@ func New(cfg Config, store Store) (*Table, error) {
 		cfg:        cfg,
 		store:      store,
 		mappings:   map[key]Mapping{},
-		quarantine: map[netip.Prefix]time.Time{},
+		quarantine: map[netip.Prefix]released{},
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -204,7 +211,7 @@ func (t *Table) loadLocked() netip.Prefix {
 		t.mappings[key{m.Owner, m.Real}] = m
 	}
 	for _, q := range st.Quarantine {
-		t.quarantine[q.Virtual] = q.Until
+		t.quarantine[q.Virtual] = released{key{q.Owner, q.Real}, q.Until}
 	}
 	return st.Pool6
 }
@@ -252,6 +259,10 @@ func (t *Table) SetLocal(prefixes []netip.Prefix) []Conflict {
 // LastSeen updated. Prefixes no longer present keep their mappings until
 // they expire (see [Table.Expire]). Default routes are never mapped.
 //
+// A prefix whose previous mapping was released and whose block is still
+// quarantined takes that block back if nothing else now overlaps it; no
+// other owner or prefix may use a quarantined block.
+//
 // The returned error reports a failure to persist; the in-memory table is
 // updated regardless.
 func (t *Table) Sync(owner Owner, real []netip.Prefix, now time.Time) (Changes, error) {
@@ -262,6 +273,7 @@ func (t *Table) Sync(owner Owner, real []netip.Prefix, now time.Time) (Changes, 
 	defer t.mu.Unlock()
 	var ch Changes
 	occAll, occIdent := t.occupiedLocked(owner, now)
+	reclaim := t.reclaimableLocked(owner, now)
 	cursors := map[cursorKey]netip.Addr{}
 	seen := map[netip.Prefix]bool{}
 	for _, p := range real {
@@ -279,8 +291,14 @@ func (t *Table) Sync(owner Owner, real []netip.Prefix, now time.Time) (Changes, 
 			t.mappings[k] = m
 			continue
 		}
-		v, ok := t.chooseLocked(p, occAll, occIdent, cursors)
-		if !ok {
+		v, ok := reclaim[p]
+		if ok && t.reclaimLocked(k, v, now) {
+			if v == p {
+				// No longer a quarantined block but the owner's own
+				// identity mapping, which its identities may overlap.
+				occIdent.Delete(v)
+			}
+		} else if v, ok = t.chooseLocked(p, occAll, occIdent, cursors); !ok {
 			ch.Unmapped = append(ch.Unmapped, p)
 			continue
 		}
@@ -351,16 +369,66 @@ func (t *Table) occupiedLocked(owner Owner, now time.Time) (occAll, occIdent *ba
 	for _, l := range t.local {
 		add(l, true)
 	}
-	for p, until := range t.quarantine {
-		if now.Before(until) {
+	for p, r := range t.quarantine {
+		if now.Before(r.until) {
 			add(p, true)
 		}
 	}
 	return occAll, occIdent
 }
 
+// reclaimableLocked returns, for each real prefix of owner that held a
+// still-quarantined block, the block it held last. Blocks released at the
+// same time are ordered by prefix, so the choice does not depend on map
+// iteration order.
+func (t *Table) reclaimableLocked(owner Owner, now time.Time) map[netip.Prefix]netip.Prefix {
+	last := map[netip.Prefix]netip.Prefix{}
+	for v, r := range t.quarantine {
+		if r.key.owner != owner || !now.Before(r.until) {
+			continue
+		}
+		prev, ok := last[r.key.real]
+		pr := t.quarantine[prev]
+		if !ok || r.until.After(pr.until) || r.until.Equal(pr.until) && comparePrefix(v, prev) < 0 {
+			last[r.key.real] = v
+		}
+	}
+	return last
+}
+
+// reclaimLocked reports whether k may take back v, the block it held
+// before it was released, and if so takes v out of quarantine. v must be
+// otherwise free: no mapping, local network, or block quarantined for
+// another (owner, real) overlaps it, except k's owner's own identity
+// mappings when v is an identity block.
+func (t *Table) reclaimLocked(k key, v netip.Prefix, now time.Time) bool {
+	ident := v == k.real
+	for _, m := range t.mappings {
+		if m.Virtual.Overlaps(v) && !(ident && m.Owner == k.owner && !m.Remapped()) {
+			return false
+		}
+	}
+	for _, l := range t.local {
+		if l.Overlaps(v) {
+			return false
+		}
+	}
+	for p, r := range t.quarantine {
+		if r.key != k && now.Before(r.until) && p.Overlaps(v) {
+			return false
+		}
+	}
+	delete(t.quarantine, v)
+	return true
+}
+
 // Expire releases mappings not seen within the GC interval and forgets
 // quarantined blocks whose quarantine has ended.
+//
+// Run it after the live owners have synced: a prefix that is still present
+// but has not been synced for longer than the GC interval expires too. If
+// it returns while its block is quarantined it takes the same block back
+// (see [Table.Sync]), but it loses the block once the quarantine ends.
 func (t *Table) Expire(now time.Time) (Changes, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -371,8 +439,8 @@ func (t *Table) Expire(now time.Time) (Changes, error) {
 		}
 	}
 	changed := len(ch.Removed) > 0
-	for p, until := range t.quarantine {
-		if !now.Before(until) {
+	for p, r := range t.quarantine {
+		if !now.Before(r.until) {
 			delete(t.quarantine, p)
 			changed = true
 		}
@@ -396,7 +464,7 @@ func (t *Table) RemoveOwner(owner Owner, now time.Time) (Changes, error) {
 func (t *Table) releaseLocked(k key, now time.Time) Mapping {
 	m := t.mappings[k]
 	delete(t.mappings, k)
-	t.quarantine[m.Virtual] = now.Add(t.cfg.Quarantine)
+	t.quarantine[m.Virtual] = released{k, now.Add(t.cfg.Quarantine)}
 	return m
 }
 
@@ -456,8 +524,8 @@ func (t *Table) saveLocked(now time.Time, force bool) error {
 		return nil
 	}
 	st := state{Version: stateVersion, Pool6: t.cfg.Pool6, Mappings: t.sortedLocked()}
-	for p, until := range t.quarantine {
-		st.Quarantine = append(st.Quarantine, quarantined{Virtual: p, Until: until})
+	for p, r := range t.quarantine {
+		st.Quarantine = append(st.Quarantine, quarantined{Virtual: p, Owner: r.key.owner, Real: r.key.real, Until: r.until})
 	}
 	slices.SortFunc(st.Quarantine, func(a, b quarantined) int { return comparePrefix(a.Virtual, b.Virtual) })
 	b, err := json.MarshalIndent(st, "", "  ")
