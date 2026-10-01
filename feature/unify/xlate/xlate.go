@@ -138,7 +138,7 @@ func (t *Translator) Outbound(q *packet.Parsed) Result {
 	}
 	newSrc, ok := t.outboundSrc(st, src)
 	if !ok {
-		return drop("source not allowed")
+		return drop("source not allowed for tailnet")
 	}
 	if !rewrite(q, src, newSrc, dst, realDst) {
 		return drop("address family mismatch")
@@ -182,7 +182,7 @@ func (t *Translator) Inbound(owner remap.Owner, q *packet.Parsed) Result {
 	}
 	vdst, ok := t.inboundDst(st, dst)
 	if !ok {
-		return drop("destination not reachable")
+		return drop("destination not reachable from tailnet")
 	}
 	if !rewrite(q, src, vsrc, dst, vdst) {
 		return drop("address family mismatch")
