@@ -121,12 +121,32 @@ func pkt(proto ipproto.Proto, src, dst string) []byte {
 // icmpErr builds an ICMP destination-unreachable error from src to dst
 // quoting the start of orig.
 func icmpErr(src, dst string, orig []byte) []byte {
+	if netip.MustParseAddr(src).Is4() {
+		return icmpError(3, 3, 0, src, dst, orig) // port unreachable
+	}
+	return icmpError(1, 4, 0, src, dst, orig) // port unreachable
+}
+
+// tooBig builds an IPv4 "fragmentation needed" or ICMPv6 "packet too big"
+// error from src to dst quoting the start of orig.
+func tooBig(src, dst string, orig []byte, mtu uint16) []byte {
+	if netip.MustParseAddr(src).Is4() {
+		return icmpError(3, 4, uint32(mtu), src, dst, orig)
+	}
+	return icmpError(2, 0, uint32(mtu), src, dst, orig)
+}
+
+// icmpError builds an ICMP error of the given type and code, with rest as
+// the second word of the ICMP header, quoting the start of orig.
+func icmpError(typ, code byte, rest uint32, src, dst string, orig []byte) []byte {
 	s, d := netip.MustParseAddr(src), netip.MustParseAddr(dst)
+	body := []byte{typ, code, 0, 0, 0, 0, 0, 0}
+	binary.BigEndian.PutUint32(body[4:], rest)
 	if s.Is4() {
-		body := append([]byte{3, 3, 0, 0, 0, 0, 0, 0}, orig[:min(len(orig), 28)]...)
+		body = append(body, orig[:min(len(orig), 28)]...)
 		return ipWrap(ipproto.ICMPv4, s, d, body, 2)
 	}
-	body := append([]byte{1, 4, 0, 0, 0, 0, 0, 0}, orig[:min(len(orig), 48)]...)
+	body = append(body, orig[:min(len(orig), 48)]...)
 	return ipWrap(ipproto.ICMPv6, s, d, body, 2)
 }
 

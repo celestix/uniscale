@@ -140,7 +140,14 @@ func (t *Translator) Outbound(q *packet.Parsed) Result {
 	if !ok {
 		return drop("source not allowed for tailnet")
 	}
-	if !rewrite(q, src, newSrc, dst, realDst) {
+	p := plan{src: newSrc, dst: realDst}
+	if q.IsError() {
+		var reason string
+		if p.quote, reason = t.outboundQuote(ss, st, q, src, newSrc); reason != "" {
+			return drop(reason)
+		}
+	}
+	if !p.apply(q) {
 		return drop("address family mismatch")
 	}
 	return Result{Verdict: ToStack, Owner: owner}
@@ -185,7 +192,14 @@ func (t *Translator) Inbound(owner remap.Owner, q *packet.Parsed) Result {
 	if !ok {
 		return drop("destination not reachable from tailnet")
 	}
-	if !rewrite(q, src, vsrc, dst, vdst) {
+	p := plan{src: vsrc, dst: vdst}
+	if q.IsError() {
+		var reason string
+		if p.quote, reason = t.inboundQuote(ss, owner, q, dst, vdst); reason != "" {
+			return drop(reason)
+		}
+	}
+	if !p.apply(q) {
 		return drop("address family mismatch")
 	}
 	return Result{Verdict: ToHost, Owner: owner}
@@ -249,22 +263,32 @@ func containsAddr(ps []netip.Prefix, a netip.Addr) bool {
 	return false
 }
 
-// rewrite replaces q's addresses and fixes checksums, including the
-// embedded packet of ICMP errors. It reports false, leaving q unchanged, if
-// a new address is from a different family than the packet.
-func rewrite(q *packet.Parsed, oldSrc, newSrc, oldDst, newDst netip.Addr) bool {
+// plan is every address change for one packet. It is decided in full
+// before anything is written, so a dropped packet is never modified.
+type plan struct {
+	src, dst netip.Addr // new outer addresses
+	quote    quoteEdit  // for ICMP errors: the quoted packet's new addresses
+}
+
+// apply writes p into q and fixes checksums. It reports false, leaving q
+// unchanged, if a new address is from a different family than the packet.
+func (p plan) apply(q *packet.Parsed) bool {
 	is4 := q.IPVersion == 4
-	if newSrc.Is4() != is4 || newDst.Is4() != is4 {
+	ok := p.src.Is4() == is4 && p.dst.Is4() == is4
+	if p.quote.valid() {
+		ok = ok && p.quote.src.Is4() == is4 && p.quote.dst.Is4() == is4
+	}
+	if !ok {
 		return false
 	}
-	if newSrc != oldSrc {
-		checksum.UpdateSrcAddr(q, newSrc)
+	if p.src != q.Src.Addr() {
+		checksum.UpdateSrcAddr(q, p.src)
 	}
-	if newDst != oldDst {
-		checksum.UpdateDstAddr(q, newDst)
+	if p.dst != q.Dst.Addr() {
+		checksum.UpdateDstAddr(q, p.dst)
 	}
-	if q.IsError() && (newSrc != oldSrc || newDst != oldDst) {
-		rewriteICMPError(q, oldSrc, newSrc, oldDst, newDst)
+	if p.quote.valid() {
+		p.quote.apply(q) // after the outer addresses: ICMPv6 checksums cover them
 	}
 	return true
 }

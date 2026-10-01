@@ -297,6 +297,41 @@ func TestFamilyMismatchDropped(t *testing.T) {
 	}
 }
 
+// funcMapper is a Mapper built from functions.
+type funcMapper struct {
+	r2v func(remap.Owner, netip.Addr) (netip.Addr, bool)
+	v2r func(netip.Addr) (remap.Owner, netip.Addr, bool)
+}
+
+func (m funcMapper) RealToVirtual(o remap.Owner, a netip.Addr) (netip.Addr, bool) { return m.r2v(o, a) }
+func (m funcMapper) VirtualToReal(a netip.Addr) (remap.Owner, netip.Addr, bool)   { return m.v2r(a) }
+
+// A quoted address translated to another family is caught before the
+// outer addresses are written.
+func TestQuotedFamilyMismatchDropped(t *testing.T) {
+	m := funcMapper{
+		r2v: func(_ remap.Owner, a netip.Addr) (netip.Addr, bool) {
+			if a == mpa("4.4.4.4") {
+				return mpa("fd00::4"), true
+			}
+			return a, true
+		},
+		v2r: func(a netip.Addr) (remap.Owner, netip.Addr, bool) { return "", netip.Addr{}, false },
+	}
+	tr := New(m, nil)
+	if err := tr.SetStacks([]Stack{{Owner: "a", Self: []netip.Addr{mpa("5.6.7.8")}}}); err != nil {
+		t.Fatal(err)
+	}
+	b := icmpErr("9.9.9.9", "5.6.7.8", pkt(ipproto.UDP, "5.6.7.8:1", "4.4.4.4:2"))
+	orig := string(b)
+	if r := tr.Inbound("a", parse(b)); r.Verdict != Drop || r.Reason != "address family mismatch" {
+		t.Fatalf("Inbound = %+v", r)
+	}
+	if string(b) != orig {
+		t.Fatal("packet modified despite family mismatch")
+	}
+}
+
 func TestSetStacksErrors(t *testing.T) {
 	tr := New(familyMapper{}, nil)
 	for name, stacks := range map[string][]Stack{
