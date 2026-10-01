@@ -21,6 +21,7 @@ import (
 	"tailscale.com/feature/unify/remap"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/packet/checksum"
+	"tailscale.com/types/ipproto"
 )
 
 // Mapper translates addresses. [*remap.Table] implements it.
@@ -295,14 +296,34 @@ func (p plan) apply(q *packet.Parsed) bool {
 	if !ok {
 		return false
 	}
+	noSum := udpNoChecksum(q)
 	if p.src != q.Src.Addr() {
 		checksum.UpdateSrcAddr(q, p.src)
 	}
 	if p.dst != q.Dst.Addr() {
 		checksum.UpdateDstAddr(q, p.dst)
 	}
+	if noSum != nil {
+		// net/packet/checksum updates a zero checksum like any other.
+		noSum[0], noSum[1] = 0, 0
+	}
 	if p.quote.valid() {
 		p.quote.apply(q) // after the outer addresses: ICMPv6 checksums cover them
 	}
 	return true
+}
+
+// udpNoChecksum returns the checksum field of q's UDP header if q is an
+// IPv4 UDP packet or first fragment sent without a checksum (a checksum of
+// 0, RFC 768), or nil. An IPv6 UDP checksum of 0 is invalid (RFC 8200) and
+// is not special.
+func udpNoChecksum(q *packet.Parsed) []byte {
+	if q.IPVersion != 4 || q.IPProto != ipproto.UDP {
+		return nil
+	}
+	t := q.Transport()
+	if len(t) < 8 || t[6] != 0 || t[7] != 0 {
+		return nil
+	}
+	return t[6:8]
 }

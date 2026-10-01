@@ -500,3 +500,43 @@ func TestHeadersWithOptions(t *testing.T) {
 		})
 	}
 }
+
+// Review focus: RFC 768 lets IPv4 UDP senders (VXLAN, GENEVE, ...) leave
+// the checksum 0, meaning "none". An incremental update would turn it into
+// a wrong non-zero checksum that receivers drop, so it must stay 0.
+func TestIPv4UDPZeroChecksumKept(t *testing.T) {
+	tr := scenario(t)
+	firstFrag, _ := fragment4(zeroUDPChecksum(pkt(ipproto.UDP, "198.18.0.0:4000", "198.19.3.4:53")), 8)
+	cases := []struct {
+		name             string
+		owner            remap.Owner // "" for Outbound
+		b                []byte
+		wantSrc, wantDst string
+	}{
+		{"outbound", "", zeroUDPChecksum(pkt(ipproto.UDP, "198.18.0.0:4000", "198.19.3.4:53")), "100.70.2.9", "10.10.3.4"},
+		{"inbound", "personal", zeroUDPChecksum(pkt(ipproto.UDP, "10.10.3.4:53", "100.70.2.9:4000")), "198.19.3.4", "198.18.0.0"},
+		{"outbound first fragment", "", firstFrag, "100.70.2.9", "10.10.3.4"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var r Result
+			if c.owner == "" {
+				r = tr.Outbound(parse(c.b))
+			} else {
+				r = tr.Inbound(c.owner, parse(c.b))
+			}
+			if r.Verdict == Drop {
+				t.Fatalf("dropped: %s", r.Reason)
+			}
+			if s, d := addrs(c.b); s != mpa(c.wantSrc) || d != mpa(c.wantDst) {
+				t.Fatalf("addresses = %v -> %v, want %s -> %s", s, d, c.wantSrc, c.wantDst)
+			}
+			if got := binary.BigEndian.Uint16(c.b[26:]); got != 0 {
+				t.Fatalf("UDP checksum = %#04x, want 0 (none)", got)
+			}
+			if !checksumsOK(c.b) {
+				t.Fatal("bad checksums after translation")
+			}
+		})
+	}
+}

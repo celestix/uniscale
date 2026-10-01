@@ -21,6 +21,7 @@ func FuzzTranslate(f *testing.F) {
 	f.Add(pkt(ipproto.ICMPv4, "[fd7a:115c:a1e0::99]:0", "[fd7a:115c:a1e0::52]:0"))
 	f.Add(icmpErr("100.99.0.1", "198.18.0.1", pkt(ipproto.UDP, "198.18.0.1:5000", "100.99.0.1:53")))
 	f.Add(icmpErr("100.88.1.4", "100.99.0.1", pkt(ipproto.UDP, "100.99.0.1:5000", "100.88.1.4:53")))
+	f.Add(zeroUDPChecksum(pkt(ipproto.UDP, "198.18.0.0:4000", "198.19.3.4:53")))
 	// Regressions found by fuzzing:
 	// IPv4 total length (1) shorter than the header.
 	f.Add([]byte("E\x00\x00\x01\x00-\x00\x00@\x06\xeb\xa0\xc6\x12\x00\x00\xc6\x13\x03\x04"))

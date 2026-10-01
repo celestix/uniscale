@@ -217,7 +217,12 @@ func checksumsOK(b []byte) bool {
 			}
 		}
 		return true
-	case ipproto.TCP, ipproto.UDP, ipproto.ICMPv6:
+	case ipproto.UDP:
+		if src.Is4() && len(body) >= 8 && body[6] == 0 && body[7] == 0 {
+			return true // RFC 768: an IPv4 UDP checksum of 0 means none
+		}
+		return csum(pseudo(src, dst, proto, len(body)), body) == 0
+	case ipproto.TCP, ipproto.ICMPv6:
 		return csum(pseudo(src, dst, proto, len(body)), body) == 0
 	}
 	return true
@@ -252,11 +257,25 @@ func TestBuildersProduceValidChecksums(t *testing.T) {
 		pkt(ipproto.ICMPv4, "[fd00::1]:0", "[fd00::2]:0"),
 		icmpErr("5.6.7.8", "1.2.3.4", pkt(ipproto.UDP, "1.2.3.4:1", "5.6.7.8:2")),
 		icmpErr("fd00::2", "fd00::1", pkt(ipproto.UDP, "[fd00::1]:1", "[fd00::2]:2")),
+		zeroUDPChecksum(pkt(ipproto.UDP, "1.2.3.4:1", "5.6.7.8:2")),
 	} {
 		if !checksumsOK(b) {
 			t.Errorf("builder produced bad checksums: % x", b)
 		}
 	}
+	// The zero-checksum exception is for IPv4 UDP only.
+	b := pkt(ipproto.UDP, "[fd00::1]:1", "[fd00::2]:2")
+	b[46], b[47] = 0, 0
+	if checksumsOK(b) {
+		t.Error("IPv6 UDP checksum 0 accepted")
+	}
+}
+
+// zeroUDPChecksum returns the IPv4 UDP packet b with its checksum field set
+// to 0 ("no checksum", RFC 768).
+func zeroUDPChecksum(b []byte) []byte {
+	b[26], b[27] = 0, 0
+	return b
 }
 
 // withIPv4Options returns b with 4 bytes of NOP options added to its IPv4
@@ -268,6 +287,25 @@ func withIPv4Options(b []byte) []byte {
 	out[10], out[11] = 0, 0
 	binary.BigEndian.PutUint16(out[10:], csum(out[:24]))
 	return out
+}
+
+// fragment4 splits the IPv4 packet b, which must have a 20-byte header,
+// into two fragments at payload offset at (a multiple of 8), with valid
+// IPv4 header checksums.
+func fragment4(b []byte, at int) (first, second []byte) {
+	mk := func(part []byte, off int, more bool) []byte {
+		h := append([]byte{}, b[:20]...)
+		binary.BigEndian.PutUint16(h[2:], uint16(20+len(part)))
+		flags := uint16(off / 8)
+		if more {
+			flags |= 0x2000
+		}
+		binary.BigEndian.PutUint16(h[6:], flags)
+		h[10], h[11] = 0, 0
+		binary.BigEndian.PutUint16(h[10:], csum(h))
+		return append(h, part...)
+	}
+	return mk(b[20:][:at], 0, true), mk(b[20+at:], at, false)
 }
 
 // withIPv6FragHeader returns b with an atomic IPv6 fragment header (offset
