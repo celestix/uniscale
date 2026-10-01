@@ -27,7 +27,8 @@ var reserved = []netip.Prefix{
 //
 //	work:     self 100.101.5.2, fd7a:115c:a1e0::52
 //	          peers 100.70.2.9, 100.88.1.4, fd7a:115c:a1e0::99
-//	          routed subnet 10.10.0.0/16; advertises our LAN 192.168.50.0/24
+//	          routed subnets 10.10.0.0/16, 172.20.0.0/16 (identity, only
+//	          work routes it); advertises our LAN 192.168.50.0/24
 //	personal: self 100.70.2.9        -> 198.18.0.0 (collides with work peer)
 //	          peer 100.70.2.10       (identity)
 //	          routed subnet 10.10.0.0/16 -> 198.19.0.0/16
@@ -55,7 +56,7 @@ func scenario(t *testing.T) *Translator {
 		return out
 	}
 	sync("work", p("100.101.5.2/32", "fd7a:115c:a1e0::52/128"),
-		p("100.70.2.9/32", "100.88.1.4/32", "fd7a:115c:a1e0::99/128"), p("10.10.0.0/16"))
+		p("100.70.2.9/32", "100.88.1.4/32", "fd7a:115c:a1e0::99/128"), p("10.10.0.0/16", "172.20.0.0/16"))
 	sync("personal", p("100.70.2.9/32"), p("100.70.2.10/32"), p("10.10.0.0/16"))
 	sync("friends", p("100.99.0.1/32", "fd7a:115c:a1e0::77/128"), p("100.88.1.4/32", "fd7a:115c:a1e0::99/128"), nil)
 
@@ -191,7 +192,46 @@ func TestInbound(t *testing.T) {
 			verdict: Drop, wantReason: "destination not reachable"},
 		{name: "work ipv6 peer", owner: "work", proto: ipproto.UDP, src: "[fd7a:115c:a1e0::99]:4000", dst: "[fd7a:115c:a1e0::52]:53",
 			verdict: ToHost, wantOwner: "work", wantSrc: "fd7a:115c:a1e0::99", wantDst: "fd7a:115c:a1e0::52"},
+
+		// Replies from the internet through the exit node this host uses.
+		{name: "tcp reply via personal exit node", owner: "personal", proto: ipproto.TCP, src: "1.1.1.1:443", dst: "100.70.2.9:4000",
+			verdict: ToHost, wantOwner: "personal", wantSrc: "1.1.1.1", wantDst: "198.18.0.0"},
+		{name: "udp reply via personal exit node", owner: "personal", proto: ipproto.UDP, src: "8.8.4.4:53", dst: "100.70.2.9:4000",
+			verdict: ToHost, wantOwner: "personal", wantSrc: "8.8.4.4", wantDst: "198.18.0.0"},
+		{name: "exit stack impersonating friends remapped peer", owner: "personal", proto: ipproto.TCP, src: "198.18.0.1:443", dst: "100.70.2.9:4000",
+			verdict: Drop, wantReason: "unmapped source"},
+		{name: "exit stack impersonating work peer", owner: "personal", proto: ipproto.TCP, src: "100.88.1.4:443", dst: "100.70.2.9:4000",
+			verdict: Drop, wantReason: "unmapped source"},
+		{name: "exit stack impersonating work subnet host", owner: "personal", proto: ipproto.TCP, src: "172.20.1.1:443", dst: "100.70.2.9:4000",
+			verdict: Drop, wantReason: "unmapped source"},
+		{name: "exit stack sending from unmapped tailscale address", owner: "personal", proto: ipproto.TCP, src: "100.100.1.1:443", dst: "100.70.2.9:4000",
+			verdict: Drop, wantReason: "unmapped source"},
+		{name: "internet source from stack offering exit", owner: "friends", proto: ipproto.TCP, src: "1.1.1.1:443", dst: "100.99.0.1:4000",
+			verdict: Drop, wantReason: "unmapped source"},
+		{name: "internet source from stack without exit", owner: "work", proto: ipproto.UDP, src: "8.8.4.4:53", dst: "100.101.5.2:4000",
+			verdict: Drop, wantReason: "unmapped source"},
 	})
+}
+
+// An ICMP error from an internet router, about a flow this host sent
+// through the exit node it uses, reaches the host with the router's address
+// and the quoted internet destination unchanged.
+func TestICMPErrorViaExitNode(t *testing.T) {
+	tr := scenario(t)
+	orig := pkt(ipproto.TCP, "100.70.2.9:4000", "1.1.1.1:443") // as the exit stack sent it
+	b := icmpErr("203.0.113.1", "100.70.2.9", orig)
+	if r := tr.Inbound("personal", parse(b)); r.Verdict != ToHost || r.Owner != "personal" {
+		t.Fatalf("Inbound = %+v", r)
+	}
+	if s, d := addrs(b); s != mpa("203.0.113.1") || d != mpa("198.18.0.0") {
+		t.Fatalf("outer = %v -> %v, want 203.0.113.1 -> 198.18.0.0", s, d)
+	}
+	if s, d := quoted(t, b); s != mpa("198.18.0.0") || d != mpa("1.1.1.1") {
+		t.Fatalf("quoted = %v -> %v, want 198.18.0.0 -> 1.1.1.1", s, d)
+	}
+	if !checksumsOK(b) {
+		t.Fatal("bad checksums")
+	}
 }
 
 func TestNotIP(t *testing.T) {

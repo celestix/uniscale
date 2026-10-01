@@ -171,12 +171,13 @@ func (t *Translator) Inbound(owner remap.Owner, q *packet.Parsed) Result {
 	if !wellFormed(q) {
 		return drop("malformed packet")
 	}
-	st, ok := t.stacks.Load().byOwner[owner]
+	ss := t.stacks.Load()
+	st, ok := ss.byOwner[owner]
 	if !ok {
 		return drop("unknown tailnet")
 	}
 	src, dst := q.Src.Addr(), q.Dst.Addr()
-	vsrc, ok := t.m.RealToVirtual(owner, src)
+	vsrc, ok := t.inboundAddr(ss, owner, src)
 	if !ok {
 		return drop("unmapped source")
 	}
@@ -188,6 +189,24 @@ func (t *Translator) Inbound(owner remap.Owner, q *packet.Parsed) Result {
 		return drop("address family mismatch")
 	}
 	return Result{Verdict: ToHost, Owner: owner}
+}
+
+// inboundAddr translates a, a remote address in owner's real space, into
+// the unified space. Mapped addresses are translated. The stack using an
+// exit node may also carry internet addresses (replies from the exit), which
+// are kept unchanged; reserved and unified-space addresses never are, so the
+// exit cannot impersonate a peer of any tailnet.
+func (t *Translator) inboundAddr(ss *stackSet, owner remap.Owner, a netip.Addr) (netip.Addr, bool) {
+	if v, ok := t.m.RealToVirtual(owner, a); ok {
+		return v, true
+	}
+	if owner != ss.exit || t.isReserved(a) {
+		return netip.Addr{}, false
+	}
+	if _, _, ok := t.m.VirtualToReal(a); ok {
+		return netip.Addr{}, false
+	}
+	return a, true
 }
 
 // inboundDst returns the host-side destination for a packet from st.
