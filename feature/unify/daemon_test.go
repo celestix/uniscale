@@ -375,7 +375,7 @@ func TestDaemon(t *testing.T) {
 	if err := h.wait(errc); err != nil {
 		t.Fatalf("runDaemon = %v", err)
 	}
-	h.checkClosed(true)
+	h.checkClosed(false)
 	if h.logs.count("unify: shutting down") != 1 {
 		t.Error("shutdown not logged")
 	}
@@ -398,7 +398,7 @@ func TestDaemonHostTUNFails(t *testing.T) {
 	if !errors.Is(err, os.ErrClosed) || !strings.Contains(err.Error(), "host TUN") {
 		t.Fatalf("runDaemon = %v, want the host TUN's failure", err)
 	}
-	h.checkClosed(true)
+	h.checkClosed(false)
 }
 
 // TestDaemonServerStops stops everything when one tailnet's LocalAPI
@@ -421,7 +421,7 @@ func TestDaemonServerStops(t *testing.T) {
 	if h.logs.count(`LocalAPI server of tailnet "b" stopped`) != 1 {
 		t.Error("stop not logged")
 	}
-	h.checkClosed(true)
+	h.checkClosed(false)
 }
 
 func TestDaemonErrors(t *testing.T) {

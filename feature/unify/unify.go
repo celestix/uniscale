@@ -457,16 +457,16 @@ func (u *Unify) Close() error {
 		if u.portClient != nil {
 			u.portClient.Close()
 		}
-		if u.loop != nil {
-			errs = append(errs, u.loop.Close())
-		} else if u.hostTUN != nil {
-			errs = append(errs, u.hostTUN.Close())
-		}
 		if u.hostRouter != nil {
 			errs = append(errs, u.hostRouter.Close())
 		}
 		if u.hostDNS != nil {
 			errs = append(errs, u.hostDNS.Close())
+		}
+		if u.loop != nil {
+			errs = append(errs, u.loop.Close())
+		} else if u.hostTUN != nil {
+			errs = append(errs, u.hostTUN.Close())
 		}
 		u.closeErr = errors.Join(errs...)
 	})
