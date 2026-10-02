@@ -16,4 +16,10 @@
 //
 // [New] builds it all and [Unify.Start] starts it; [Unify.Stack] gives
 // each tailnet's stack, to serve its LocalAPI.
+//
+// On Linux the package registers the "unify" feature and sets tailscaled's
+// --unify hook, [tailscale.com/cmd/tailscaled/tailscaledhooks.Unify]. The
+// hook runs it all on the host's real TUN device, router and DNS
+// configurator, and serves each tailnet's LocalAPI on its own socket
+// ([TailnetSocket]).
 package unify

@@ -142,6 +142,7 @@ var args struct {
 	httpProxyAddr       string // listen address for HTTP proxy server
 	disableLogs         bool
 	hardwareAttestation boolFlag
+	unify               bool // run several tailnets at once; see hookRunUnify
 }
 
 var (
@@ -233,6 +234,7 @@ func main() {
 	flag.BoolVar(&printVersion, "version", false, "print version information and exit")
 	flag.BoolVar(&args.disableLogs, "no-logs-no-support", false, "disable log uploads; this also disables any technical support")
 	flag.StringVar(&args.confFile, "config", "", "path to config file, or 'vm:user-data' to use the VM's user-data (EC2); prefix with 'optional:' to boot unconfigured when the source is absent instead of failing")
+	flag.BoolVar(&args.unify, "unify", false, "run several tailnets at once (tailnet unification); see <statedir>/unify/config.json")
 	if buildfeatures.HasTPM {
 		flag.Var(&args.hardwareAttestation, "hardware-attestation", `use hardware-backed keys to bind node identity to this device when supported
 by the OS and hardware. Uses TPM 2.0 on Linux and Windows; SecureEnclave on
@@ -305,6 +307,11 @@ store state on filesystem.`)
 	if buildfeatures.HasBird && args.birdSocketPath != "" && !wgengine.HookNewBird.IsSet() {
 		log.SetFlags(0)
 		log.Fatalf("--bird-socket is not supported on %s", runtime.GOOS)
+	}
+
+	if args.unify && !hookRunUnify.IsSet() {
+		log.SetFlags(0)
+		log.Fatalf("--unify is not available: tailnet unification needs Linux and a tailscaled built without ts_omit_unify, and must not be disabled with TS_DISABLE_FEATURE")
 	}
 
 	// Only apply a default statepath when neither have been provided, so that a
@@ -587,8 +594,17 @@ func run() (err error) {
 		hostinfo.SetApp(app)
 	}
 
+	if args.unify {
+		return hookRunUnify.Get()(logf, publicLogID, sys)
+	}
 	return startIPNServer(context.Background(), logf, publicLogID, sys)
 }
+
+// hookRunUnify runs tailscaled in tailnet unification mode (--unify)
+// instead of startIPNServer, until SIGINT or SIGTERM. It is set by
+// unify.go on Linux when built without ts_omit_unify, unless
+// TS_DISABLE_FEATURE disables unify.
+var hookRunUnify feature.Hook[func(logf logger.Logf, logID logid.PublicID, sys *tsd.System) error]
 
 var (
 	hookSetSysDrive           feature.Hook[func(*tsd.System, logger.Logf)]

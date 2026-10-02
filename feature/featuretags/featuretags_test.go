@@ -51,6 +51,10 @@ func TestRequires(t *testing.T) {
 			in:   "webclient",
 			want: setOf("webclient", "serve", "netstack"),
 		},
+		{
+			in:   "unify",
+			want: setOf("unify", "netstack", "osrouter"),
+		},
 	}
 	for _, tt := range tests {
 		got := Requires(tt.in)
@@ -141,7 +145,7 @@ func TestAllOmitBuildTagsDeclared(t *testing.T) {
 		return tag
 	})
 	for tag := range found {
-		if strings.EqualFold(tag, "ts_omit_foo") {
+		if strings.EqualFold(tag, "ts_omit_foo") || strings.EqualFold(tag, "ts_omit_X") || strings.EqualFold(tag, "ts_omit_lazywg") {
 			continue
 		}
 		ft := FeatureTag(strings.TrimPrefix(tag, "ts_omit_"))

@@ -1084,7 +1084,7 @@ func TestCloseOrder(t *testing.T) {
 	if err := h.u.Close(); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"stack " + PrimaryName, "stack b", "router", "dns", "tun"}
+	want := []string{"stack " + PrimaryName, "stack b", "tun", "router", "dns"}
 	if got := h.events.get(); !slices.Equal(got, want) {
 		t.Errorf("close order %q, want %q", got, want)
 	}

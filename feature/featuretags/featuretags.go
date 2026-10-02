@@ -346,6 +346,13 @@ var Features = map[FeatureTag]FeatureMeta{
 		Sym:  "UDPTransport",
 		Desc: "UDP transport to peers (if omitted, all peer traffic is relayed over DERP)",
 	},
+	"unify": {
+		Sym:  "Unify",
+		Desc: "Multiple simultaneous tailnets (tailnet unification)",
+		// Each tailnet's stack serves its node through netstack, and all
+		// of them share the host's real router (Linux only).
+		Deps: []FeatureTag{"netstack", "osrouter"},
+	},
 	"unixsocketidentity": {
 		Sym:  "UnixSocketIdentity",
 		Desc: "differentiate between users accessing the LocalAPI over unix sockets (if omitted, all users have full access)",

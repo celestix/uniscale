@@ -6,9 +6,12 @@ package unify
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"path/filepath"
@@ -18,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"tailscale.com/derp/derpserver"
 	"tailscale.com/feature/unify/chantun"
 	"tailscale.com/feature/unify/osglue"
 	"tailscale.com/feature/unify/remap"
@@ -27,14 +31,15 @@ import (
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/packet"
+	"tailscale.com/net/stun/stuntest"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsd"
 	"tailscale.com/tsnet"
 	"tailscale.com/tstest"
-	"tailscale.com/tstest/integration"
 	"tailscale.com/tstest/integration/testcontrol"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/nettype"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/wgengine/router"
 )
@@ -51,6 +56,45 @@ import (
 // netstack answers ICMP echo for their addresses.
 
 const integrationTimeout = 20 * time.Second
+
+// runDERPAndSTUN starts a DERP and a STUN server on 127.0.0.1, as
+// integration.RunDERPAndSTUN does. Tests here cannot import
+// tstest/integration: it links feature/condregister, which links this
+// package.
+func runDERPAndSTUN(t *testing.T, logf logger.Logf) *tailcfg.DERPMap {
+	t.Helper()
+	d := derpserver.New(key.NewNode(), logf)
+	srv := httptest.NewUnstartedServer(derpserver.Handler(d))
+	srv.Config.ErrorLog = logger.StdLogger(logf)
+	srv.Config.TLSNextProto = make(map[string]func(*http.Server, *tls.Conn, http.Handler))
+	srv.StartTLS()
+	stunAddr, stunCleanup := stuntest.ServeWithPacketListener(t, nettype.Std{})
+	t.Cleanup(func() {
+		srv.CloseClientConnections()
+		srv.Close()
+		d.Close()
+		stunCleanup()
+	})
+	return &tailcfg.DERPMap{
+		Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
+			1: {
+				RegionID:   1,
+				RegionCode: "test",
+				Nodes: []*tailcfg.DERPNode{{
+					Name:             "t1",
+					RegionID:         1,
+					HostName:         "127.0.0.1",
+					IPv4:             "127.0.0.1",
+					IPv6:             "none",
+					STUNPort:         stunAddr.Port,
+					DERPPort:         srv.Listener.Addr().(*net.TCPAddr).Port,
+					InsecureForTests: true,
+					STUNTestIP:       "127.0.0.1",
+				}},
+			},
+		},
+	}
+}
 
 func startTestControl(t *testing.T, derpMap *tailcfg.DERPMap, logf logger.Logf) string {
 	t.Helper()
@@ -425,7 +469,7 @@ func TestIntegration(t *testing.T) {
 	t.Cleanup(func() { netns.SetEnabled(true) })
 
 	logf := tstest.WhileTestRunningLogger(t)
-	derpMap := integration.RunDERPAndSTUN(t, logf, "127.0.0.1")
+	derpMap := runDERPAndSTUN(t, logf)
 	urlA, urlB := startTestControl(t, derpMap, logf), startTestControl(t, derpMap, logf)
 	peerA := startTestPeer(t, ctx, urlA, "peer-a")
 	peerB := startTestPeer(t, ctx, urlB, "peer-b")

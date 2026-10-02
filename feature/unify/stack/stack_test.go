@@ -5,6 +5,7 @@ package stack
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"tailscale.com/client/local"
+	"tailscale.com/derp/derpserver"
 	"tailscale.com/feature/unify/chantun"
 	"tailscale.com/feature/unify/osglue"
 	"tailscale.com/ipn"
@@ -30,16 +32,19 @@ import (
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/packet"
+	"tailscale.com/net/stun/stuntest"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/safesocket"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsd"
 	"tailscale.com/tsnet"
 	"tailscale.com/tstest"
-	"tailscale.com/tstest/integration"
 	"tailscale.com/tstest/integration/testcontrol"
 	"tailscale.com/types/ipproto"
+	"tailscale.com/types/key"
+	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
+	"tailscale.com/types/nettype"
 	"tailscale.com/wgengine/router"
 )
 
@@ -53,7 +58,7 @@ func startControl(t *testing.T) string {
 
 	logf := tstest.WhileTestRunningLogger(t)
 	control := &testcontrol.Server{
-		DERPMap:        integration.RunDERPAndSTUN(t, logf, "127.0.0.1"),
+		DERPMap:        runDERPAndSTUN(t, logf),
 		DNSConfig:      &tailcfg.DNSConfig{Proxied: true},
 		MagicDNSDomain: "tail-scale.ts.net",
 		Logf:           logf,
@@ -62,6 +67,45 @@ func startControl(t *testing.T) string {
 	control.HTTPTestServer.Start()
 	t.Cleanup(control.HTTPTestServer.Close)
 	return control.HTTPTestServer.URL
+}
+
+// runDERPAndSTUN starts a DERP and a STUN server on 127.0.0.1, as
+// integration.RunDERPAndSTUN does. Tests here cannot import
+// tstest/integration: it links feature/condregister, which links
+// feature/unify, which imports this package.
+func runDERPAndSTUN(t *testing.T, logf logger.Logf) *tailcfg.DERPMap {
+	t.Helper()
+	d := derpserver.New(key.NewNode(), logf)
+	srv := httptest.NewUnstartedServer(derpserver.Handler(d))
+	srv.Config.ErrorLog = logger.StdLogger(logf)
+	srv.Config.TLSNextProto = make(map[string]func(*http.Server, *tls.Conn, http.Handler))
+	srv.StartTLS()
+	stunAddr, stunCleanup := stuntest.ServeWithPacketListener(t, nettype.Std{})
+	t.Cleanup(func() {
+		srv.CloseClientConnections()
+		srv.Close()
+		d.Close()
+		stunCleanup()
+	})
+	return &tailcfg.DERPMap{
+		Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
+			1: {
+				RegionID:   1,
+				RegionCode: "test",
+				Nodes: []*tailcfg.DERPNode{{
+					Name:             "t1",
+					RegionID:         1,
+					HostName:         "127.0.0.1",
+					IPv4:             "127.0.0.1",
+					IPv6:             "none",
+					STUNPort:         stunAddr.Port,
+					DERPPort:         srv.Listener.Addr().(*net.TCPAddr).Port,
+					InsecureForTests: true,
+					STUNTestIP:       "127.0.0.1",
+				}},
+			},
+		},
+	}
 }
 
 // startPeer starts a plain tsnet node and returns it with its IPv4

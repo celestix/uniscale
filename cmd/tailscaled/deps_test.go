@@ -9,6 +9,7 @@ import (
 
 	"tailscale.com/feature/featuretags"
 	"tailscale.com/tstest/deptest"
+	"tailscale.com/util/set"
 )
 
 func TestOmitServiceClientPrefs(t *testing.T) {
@@ -99,7 +100,7 @@ func TestOmitLocalClient(t *testing.T) {
 	deptest.DepChecker{
 		GOOS:   "linux",
 		GOARCH: "amd64",
-		Tags:   "ts_omit_webclient,ts_omit_relayserver,ts_omit_oauthkey,ts_omit_acme",
+		Tags:   "ts_omit_webclient,ts_omit_relayserver,ts_omit_oauthkey,ts_omit_acme,ts_omit_unify",
 		BadDeps: map[string]string{
 			"tailscale.com/client/local": "unexpected",
 		},
@@ -242,12 +243,45 @@ func TestNetstack(t *testing.T) {
 	deptest.DepChecker{
 		GOOS:   "linux",
 		GOARCH: "amd64",
-		Tags:   "ts_omit_gro,ts_omit_netstack,ts_omit_outboundproxy,ts_omit_serve,ts_omit_ssh,ts_omit_webclient,ts_omit_tap",
+		Tags:   "ts_omit_gro,ts_omit_netstack,ts_omit_outboundproxy,ts_omit_serve,ts_omit_ssh,ts_omit_webclient,ts_omit_tap,ts_omit_unify",
 		OnDep: func(dep string) {
 			if strings.Contains(dep, "gvisor") {
 				t.Errorf("unexpected gvisor dep: %q", dep)
 			}
 		},
+	}.Check(t)
+}
+
+func TestOmitUnify(t *testing.T) {
+	unifyPkgs := []string{
+		"tailscale.com/feature/unify",
+		"tailscale.com/feature/unify/chantun",
+		"tailscale.com/feature/unify/osglue",
+		"tailscale.com/feature/unify/remap",
+		"tailscale.com/feature/unify/stack",
+		"tailscale.com/feature/unify/xlate",
+	}
+	// Linked on Linux by default...
+	deptest.DepChecker{
+		GOOS:     "linux",
+		GOARCH:   "amd64",
+		WantDeps: set.Of(unifyPkgs...),
+	}.Check(t)
+	// ... but not with ts_omit_unify, nor on other platforms.
+	bad := map[string]string{}
+	for _, pkg := range unifyPkgs {
+		bad[pkg] = "unexpected tailnet unification dep"
+	}
+	deptest.DepChecker{
+		GOOS:    "linux",
+		GOARCH:  "amd64",
+		Tags:    "ts_omit_unify,ts_include_cli",
+		BadDeps: bad,
+	}.Check(t)
+	deptest.DepChecker{
+		GOOS:    "darwin",
+		GOARCH:  "arm64",
+		BadDeps: bad,
 	}.Check(t)
 }
 
