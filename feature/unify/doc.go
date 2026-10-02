@@ -13,4 +13,7 @@
 //
 // The primary tailnet, [PrimaryName], uses tailscaled's usual state and
 // socket. The others are listed in the file at [ConfigPath].
+//
+// [New] builds it all and [Unify.Start] starts it; [Unify.Stack] gives
+// each tailnet's stack, to serve its LocalAPI.
 package unify

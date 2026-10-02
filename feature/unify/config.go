@@ -63,6 +63,16 @@ func TailnetDir(stateDir, name string) string {
 	return filepath.Join(stateDir, "unify", "tailnets", name)
 }
 
+// TailnetSocket returns the LocalAPI socket path of tailnet name, other
+// than the primary, given mainSocket, tailscaled's --socket: the file
+// tailscaled-<name>.sock next to it, or "" if mainSocket is "".
+func TailnetSocket(mainSocket, name string) string {
+	if mainSocket == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(mainSocket), "tailscaled-"+name+".sock")
+}
+
 // CheckName reports whether name is a valid name for a tailnet in
 // [Config]: 1 to 32 lowercase ASCII letters, digits or hyphens, and not
 // [PrimaryName].

@@ -270,6 +270,9 @@ func TestPaths(t *testing.T) {
 		{RemapPath(sd), "/var/lib/tailscale/unify/remap.json"},
 		{TailnetDir(sd, "work"), "/var/lib/tailscale/unify/tailnets/work"},
 		{TailnetDir("rel", "home"), "rel/unify/tailnets/home"},
+		{TailnetSocket("/var/run/tailscale/tailscaled.sock", "work"), "/var/run/tailscale/tailscaled-work.sock"},
+		{TailnetSocket("tailscaled.sock", "home"), "tailscaled-home.sock"},
+		{TailnetSocket("", "work"), ""},
 	} {
 		if c.got != filepath.FromSlash(c.want) {
 			t.Errorf("got %q, want %q", c.got, c.want)
