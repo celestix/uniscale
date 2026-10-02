@@ -213,6 +213,11 @@ func New(cfg Config) (_ *Stack, err error) {
 	if s.lb, err = ipnlocal.NewLocalBackend(s.logf, cfg.LogID, s.sys, flags); err != nil {
 		return nil, err
 	}
+	// Peerapi, serve and the web client are served by netstack only. The
+	// stack's real addresses may be another tailnet's addresses on the
+	// host, so a kernel listener on them would answer that tailnet's
+	// peers.
+	s.lb.SetNoKernelListeners(true)
 	if cfg.Dir != "" {
 		s.lb.SetVarRoot(cfg.Dir)
 	}

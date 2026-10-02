@@ -280,8 +280,9 @@ func (s *localListener) handleListenersAccept(ln net.Listener) error {
 //
 // b.mu must be held.
 func (b *LocalBackend) updateServeTCPPortNetMapAddrListenersLocked(ports []uint16) {
-	if b.sys.IsNetstack() {
-		// don't listen on netmap addresses if we're in userspace mode
+	if b.sys.IsNetstack() || b.noKernelListeners {
+		// don't listen on netmap addresses if we're in userspace mode,
+		// or if netstack must serve them alone (SetNoKernelListeners)
 		return
 	}
 	// close existing listeners where port

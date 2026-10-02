@@ -23,13 +23,17 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/tailscale/wireguard-go/tun"
+	"github.com/tailscale/wireguard-go/tun/tuntest"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/envknob"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/health"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store/mem"
@@ -1131,16 +1135,20 @@ func newTestBackend(t *testing.T, opts ...any) *LocalBackend {
 	bus := eventbustest.NewBus(t)
 	sys := tsd.NewSystemWithBus(bus)
 
+	var tunDev tun.Device // nil for a fake TUN: netstack only
 	for _, o := range opts {
 		switch v := o.(type) {
 		case policyclient.Client:
 			sys.PolicyClient.Set(v)
+		case tun.Device:
+			tunDev = v
 		default:
 			panic(fmt.Sprintf("unsupported option type %T", v))
 		}
 	}
 
 	e, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{
+		Tun:           tunDev,
 		SetSubsystem:  sys.Set,
 		HealthTracker: sys.HealthTracker.Get(),
 		Metrics:       sys.UserMetricsRegistry(),
@@ -2041,4 +2049,79 @@ func TestValidateServeConfigUpdate(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestNoKernelListeners checks that peerapi, serve and the web client
+// listen on the node's addresses through the kernel by default, as they
+// always have, and that after SetNoKernelListeners they do not: netstack
+// serves their ports alone.
+func TestNoKernelListeners(t *testing.T) {
+	// Serve's kernel listeners otherwise wait for the Tailscale interface
+	// index, which tests do not set.
+	envknob.SetenvForTest(t, "TS_SERVE_ALLOW_ALL_INTERFACES", "true")
+
+	for _, noKernel := range []bool{false, true} {
+		t.Run(fmt.Sprintf("noKernelListeners=%v", noKernel), func(t *testing.T) {
+			// A real TUN device, as tailscaled has: in userspace
+			// networking mode nothing listens through the kernel anyway.
+			b := newTestBackend(t, tuntest.NewChannelTUN().TUN())
+			if b.sys.IsNetstack() {
+				t.Fatal("backend in userspace networking mode")
+			}
+			if noKernel {
+				b.SetNoKernelListeners(true)
+			}
+			b.mu.Lock()
+			defer b.mu.Unlock()
+
+			// Peerapi.
+			// Android always skips the kernel listener. FreeBSD does with
+			// netstack, which this backend does not have.
+			wantSkip := noKernel || runtime.GOOS == "android"
+			ps := &peerAPIServer{b: b}
+			if got := ps.skipKernelListener(); got != wantSkip {
+				t.Errorf("skipKernelListener = %v, want %v", got, wantSkip)
+			}
+			ln, err := ps.listen(netip.MustParseAddr("127.0.0.1"), 0)
+			if err != nil {
+				t.Fatalf("peerapi listen: %v", err)
+			}
+			defer ln.Close()
+			if _, fake := ln.(*fakePeerAPIListener); fake != wantSkip {
+				t.Errorf("peerapi listener is %T; want the netstack-only fake: %v", ln, wantSkip)
+			}
+			if port := ln.Addr().(*net.TCPAddr).Port; wantSkip && port != 1 {
+				t.Errorf("fake peerapi listener port = %d, want 1", port)
+			}
+
+			// Serve, on the netmap's one address.
+			b.updateServeTCPPortNetMapAddrListenersLocked([]uint16{8443})
+			got := len(b.serveListeners)
+			b.updateServeTCPPortNetMapAddrListenersLocked(nil) // closes them
+			if want := btoi(!noKernel); got != want {
+				t.Errorf("serve opened %d kernel listeners, want %d", got, want)
+			}
+
+			// The remote web client. Its kernel listener needs the
+			// Tailscale interface index, so only the opt-in is checked.
+			if noKernel && buildfeatures.HasWebClient {
+				b.webClientAtomicBool.Store(true)
+				b.exposeRemoteWebClientAtomicBool.Store(true)
+				b.setTCPPortsInterceptedFromNetmapAndPrefsLocked(b.pm.CurrentPrefs())
+				if n := len(b.webClientListeners); n != 0 {
+					t.Errorf("web client opened %d kernel listeners, want 0", n)
+				}
+				if !b.ShouldInterceptTCPPort(webClientPort) {
+					t.Errorf("netstack does not serve the web client port %d", webClientPort)
+				}
+			}
+		})
+	}
+}
+
+func btoi(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }

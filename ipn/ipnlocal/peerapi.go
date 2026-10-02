@@ -65,7 +65,13 @@ type peerAPIServer struct {
 // skipKernelListener reports whether peerapi should not create a
 // kernel-level listener at all and instead rely on netstack intercepting
 // connections to the peerapi port. See [fakePeerAPIListener].
+//
+// s.b.mu must be held.
 func (s *peerAPIServer) skipKernelListener() bool {
+	if s.b.noKernelListeners {
+		// See [LocalBackend.SetNoKernelListeners].
+		return true
+	}
 	switch runtime.GOOS {
 	case "android":
 		// Android for whatever reason often has problems creating the

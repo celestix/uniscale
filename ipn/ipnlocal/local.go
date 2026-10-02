@@ -395,6 +395,11 @@ type LocalBackend struct {
 	serveListeners     map[netip.AddrPort]*localListener // listeners for local serve traffic
 	serveProxyHandlers sync.Map                          // string (HTTPHandler.Proxy) => *reverseProxy
 
+	// noKernelListeners is whether peerapi, serve and the web client must
+	// not listen on this node's addresses through the kernel; see
+	// [LocalBackend.SetNoKernelListeners].
+	noKernelListeners bool
+
 	// dialPlan is any dial plan that we've received from the control
 	// server during a previous connection; it is cleared on logout.
 	dialPlan atomic.Pointer[tailcfg.ControlDialPlan] // TODO(nickkhyl): maybe move to nodeBackend?
@@ -6317,6 +6322,21 @@ func (b *LocalBackend) SetVarRoot(dir string) {
 	b.varRoot = dir
 }
 
+// SetNoKernelListeners sets whether b must not listen on this node's
+// Tailscale addresses through the kernel for peerapi, serve and the web
+// client. Netstack then serves their ports to peers alone, as in userspace
+// networking mode, and the local host cannot reach them on those
+// addresses. It is for embedders that run several backends in one
+// process: a kernel listener on an address that is also another backend's
+// would answer that backend's peers.
+//
+// It should only be called before the LocalBackend is started.
+func (b *LocalBackend) SetNoKernelListeners(v bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.noKernelListeners = v
+}
+
 // SetLogFlusher sets a func to be called to flush log uploads.
 //
 // It should only be called before the LocalBackend is used.
@@ -7618,8 +7638,9 @@ func (b *LocalBackend) setTCPPortsInterceptedFromNetmapAndPrefsLocked(prefs ipn.
 	if b.ShouldExposeRemoteWebClient() {
 		handlePorts = append(handlePorts, webClientPort)
 
-		// don't listen on netmap addresses if we're in userspace mode
-		if !b.sys.IsNetstack() {
+		// don't listen on netmap addresses if we're in userspace mode,
+		// or if netstack must serve them alone (SetNoKernelListeners)
+		if !b.sys.IsNetstack() && !b.noKernelListeners {
 			b.updateWebClientListenersLocked()
 		}
 	}
