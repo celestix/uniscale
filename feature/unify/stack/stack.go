@@ -25,6 +25,7 @@ import (
 	"github.com/tailscale/wireguard-go/tun"
 	"tailscale.com/client/local"
 	"tailscale.com/control/controlclient"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/store"
@@ -223,7 +224,7 @@ func New(cfg Config) (_ *Stack, err error) {
 	}
 	// Configure the web client to connect to this stack's socket, not the
 	// primary daemon's default socket.
-	if cfg.SocketPath != "" {
+	if buildfeatures.HasWebClient && cfg.SocketPath != "" {
 		s.lb.ConfigureWebClient(&local.Client{
 			Socket:        cfg.SocketPath,
 			UseSocketOnly: true,
