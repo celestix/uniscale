@@ -155,6 +155,8 @@ func TestOutbound(t *testing.T) {
 			verdict: ToStack, wantOwner: "personal", wantSrc: "100.70.2.9", wantDst: "1.1.1.1"},
 		{name: "internet with another tailnet's source", proto: ipproto.TCP, src: "100.101.5.2:4000", dst: "1.1.1.1:443",
 			verdict: Drop, wantReason: DropSourceNotAllowed},
+		{name: "unmapped private address never goes to exit", proto: ipproto.TCP, src: "198.18.0.0:4000", dst: "192.168.7.7:443",
+			verdict: Drop, wantReason: DropNoRoute},
 		{name: "unmapped tailscale address never goes to exit", proto: ipproto.TCP, src: "198.18.0.0:4000", dst: "100.100.1.1:443",
 			verdict: Drop, wantReason: DropNoRoute},
 		{name: "unmapped pool address never goes to exit", proto: ipproto.TCP, src: "198.18.0.0:4000", dst: "198.18.9.9:443",
@@ -311,6 +313,76 @@ func TestExitSourceMustBeInternet(t *testing.T) {
 				if string(b) != orig {
 					t.Fatal("dropped packet was modified")
 				}
+			}
+		})
+	}
+}
+
+// Review focus (R22): the host's traffic goes through the exit node it uses
+// only to internet destinations, the same rule as for the exit's replies.
+// Anything else without a mapping, such as a private network the host
+// cannot reach otherwise, has no route: it must not leak to the exit
+// node's tailnet, and the packet loop answers it with ICMP unreachable.
+func TestExitDestinationMustBeInternet(t *testing.T) {
+	tr := exitScenario(t)
+	for _, c := range []struct {
+		dst    string
+		want   Verdict
+		reason DropReason // for drops
+	}{
+		{"1.1.1.1", ToStack, 0},
+		{"203.0.113.9", ToStack, 0},
+		{"172.32.0.1", ToStack, 0}, // just outside 172.16.0.0/12
+		{"2606:4700:4700::1111", ToStack, 0},
+		{"10.0.0.1", Drop, DropNoRoute},
+		{"172.16.0.1", Drop, DropNoRoute},
+		{"172.31.255.255", Drop, DropNoRoute},
+		{"192.168.1.1", Drop, DropNoRoute},
+		{"127.0.0.1", Drop, DropNoRoute},
+		{"0.0.0.0", Drop, DropNoRoute},
+		{"224.0.0.251", Drop, DropNoRoute},
+		{"239.255.255.250", Drop, DropNoRoute},
+		{"169.254.169.254", Drop, DropNoRoute},
+		{"255.255.255.255", Drop, DropNoRoute},
+		{"100.64.0.9", Drop, DropNoRoute}, // reserved
+		{"::1", Drop, DropNoRoute},
+		{"::", Drop, DropNoRoute},
+		{"ff02::1", Drop, DropNoRoute},
+		{"fe80::1", Drop, DropNoRoute},
+		{"fc00::1", Drop, DropNoRoute},
+		{"fd12:3456::1", Drop, DropNoRoute},
+		{"::ffff:1.1.1.1", Drop, DropNoRoute},    // IPv4-mapped: not an IPv6 internet address
+		{"::ffff:100.64.0.2", Drop, DropNoRoute}, // would dodge the reserved IPv4 ranges
+		// A public subnet another tailnet routes is that tailnet's, not
+		// the exit's: x's source may not enter it.
+		{"198.51.100.7", Drop, DropSourceNotAllowed},
+	} {
+		t.Run(c.dst, func(t *testing.T) {
+			dst := mpa(c.dst)
+			src := "100.64.0.1:4000"
+			if dst.Is6() {
+				src = "[fd7a:115c:a1e0::1]:4000"
+			}
+			b := pkt(ipproto.UDP, src, netip.AddrPortFrom(dst, 53).String())
+			orig := string(b)
+			r := tr.Outbound(parse(b))
+			if r.Verdict != c.want {
+				t.Fatalf("Outbound = %+v, want %v", r, c.want)
+			}
+			if c.want == ToStack {
+				if r.Owner != "x" {
+					t.Fatalf("owner = %q, want x", r.Owner)
+				}
+				if _, d := addrs(b); d != dst {
+					t.Fatalf("destination = %v, want it unchanged", d)
+				}
+				return
+			}
+			if r.Reason != c.reason {
+				t.Fatalf("reason = %q, want %q", r.Reason, c.reason)
+			}
+			if string(b) != orig {
+				t.Fatal("dropped packet was modified")
 			}
 		})
 	}

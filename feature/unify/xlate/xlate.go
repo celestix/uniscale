@@ -216,9 +216,12 @@ func (t *Translator) Outbound(q *packet.Parsed) Result {
 
 // outboundDst returns the stack a packet from the host to dst goes to, and
 // dst in that stack's real space: the owner of dst's mapping, or the stack
-// using an exit node for any other address that is not reserved. Quad-100
-// is never a peer's address: it goes to the stack serving it, if any,
-// whatever mapping covers it.
+// using an exit node for an internet address ([Translator.isInternet], the
+// rule for the exit's replies). Any other address has no route: private,
+// link-local and other non-internet networks the host has no route for
+// never leak to the exit node's tailnet. Quad-100 is never a peer's
+// address: it goes to the stack serving it, if any, whatever mapping
+// covers it.
 func (t *Translator) outboundDst(ss *stackSet, dst netip.Addr) (remap.Owner, netip.Addr, bool) {
 	if isQuad100(dst) {
 		return ss.quad100, dst, ss.quad100 != ""
@@ -226,7 +229,7 @@ func (t *Translator) outboundDst(ss *stackSet, dst netip.Addr) (remap.Owner, net
 	if owner, realDst, ok := t.m.VirtualToReal(dst); ok {
 		return owner, realDst, true
 	}
-	if ss.exit == "" || t.isReserved(dst) {
+	if ss.exit == "" || !t.isInternet(dst) {
 		return "", netip.Addr{}, false
 	}
 	return ss.exit, dst, true
@@ -382,9 +385,10 @@ var (
 func isQuad100(a netip.Addr) bool { return a == quad100v4 || a == quad100v6 }
 
 // isInternet reports whether a may be carried unchanged through an exit
-// node this host uses: a global unicast address that is neither private
-// (RFC 1918, ULA) nor reserved. IPv4-mapped IPv6 addresses are refused,
-// as they would escape the IPv4 reserved ranges.
+// node this host uses, as a destination or as a reply's source: a global
+// unicast address that is neither private (RFC 1918, ULA) nor reserved.
+// IPv4-mapped IPv6 addresses are refused, as they would escape the IPv4
+// reserved ranges.
 func (t *Translator) isInternet(a netip.Addr) bool {
 	return a.IsGlobalUnicast() && !a.IsPrivate() && !a.Is4In6() && !t.isReserved(a)
 }
