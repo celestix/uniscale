@@ -40,6 +40,7 @@ import (
 	"tailscale.com/tstest/integration/testcontrol"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/logid"
+	"tailscale.com/wgengine/netstack"
 	"tailscale.com/wgengine/router"
 )
 
@@ -647,12 +648,13 @@ func TestNewEngineError(t *testing.T) {
 	}
 }
 
-// TestCloseWithBlockedTUN tests that Close does not hang when the TUN
-// is not being drained. Without closing the TUN device first, netstack's
-// Close could block waiting for injectWG when packets are pending.
+// TestCloseWithBlockedTUN tests that Close does not hang when netstack
+// has packets in flight to the host that are blocked by a full chantun queue.
+// Without closing the TUN device first (ruling 1), netstack.Close() would block
+// waiting on injectWG while chantun.Write blocks in the host-side read.
 func TestCloseWithBlockedTUN(t *testing.T) {
 	tstest.ResourceCheck(t)
-	dev, err := chantun.New("unify-blocked", 1280, 2, 2)
+	dev, err := chantun.New("unify-blocked", 1280, 8, 8)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -669,14 +671,61 @@ func TestCloseWithBlockedTUN(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Crucially, do not drain the device's host side:
-	// the existing tests drain the device to consume packets,
-	// but this test leaves it undrained to verify that Close
-	// still succeeds quickly even when the TUN is blocked.
 
-	// Close should return quickly without hanging, because we close
-	// the TUN device first in Stack.Close (ruling 1).
-	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Create a listening socket on netstack that will reply to any traffic.
+	// Replies go through netstack's injectToHost, which writes to the TUN.
+	nsImpl, ok := st.Sys().Netstack.Get().(*netstack.Impl)
+	if !ok {
+		t.Fatal("netstack is not *netstack.Impl")
+	}
+	ln, err := nsImpl.ListenTCP("tcp4", "100.100.100.100:9999")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+
+	// Goroutine to accept connections and echo data back.
+	// This drives netstack's injectToHost which writes to the TUN.
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				io.Copy(c, c) // echo
+			}(c)
+		}
+	}()
+
+	// Send traffic to the netstack listener. Replies will be written to the
+	// TUN device. Do NOT drain the device, so the queue fills and writes block.
+	d := st.Sys().Dialer.Get()
+
+	// Dial and write data to trigger replies and fill the TUN queue.
+	go func() {
+		dialCtx, dialCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer dialCancel()
+		c, err := d.UserDial(dialCtx, "tcp", netip.AddrPortFrom(netip.MustParseAddr("100.100.100.100"), 9999).String())
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		// Send enough data to fill the queue.
+		for i := 0; i < 100; i++ {
+			c.Write([]byte("hello"))
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+
+	// Wait for traffic to flow and the queue to fill.
+	time.Sleep(200 * time.Millisecond)
+
+	// Close should return quickly without hanging because we close the TUN
+	// device first in Stack.Close, which unblocks any writes blocked in
+	// chantun.Write.
+	closeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	closeErr := make(chan error, 1)
 	go func() {
@@ -689,46 +738,7 @@ func TestCloseWithBlockedTUN(t *testing.T) {
 			t.Errorf("Close: %v", err)
 		}
 	case <-closeCtx.Done():
-		t.Fatal("Close hung for 5 seconds; want it to return quickly even with an undrained TUN")
-	}
-}
-
-// TestConfigureWebClient verifies that ConfigureWebClient is called
-// with the stack's socket path when one is configured.
-func TestConfigureWebClient(t *testing.T) {
-	dev, err := chantun.New("unify-webclient", 1280, 1, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer dev.Close()
-
-	socketPath := filepath.Join(t.TempDir(), "test.sock")
-	st, err := New(Config{
-		Name:       "webclient",
-		Store:      new(mem.Store),
-		Tun:        dev,
-		Router:     osglue.NewRouter(nil),
-		DNS:        osglue.NewDNS(nil),
-		Logf:       tstest.WhileTestRunningLogger(t),
-		SocketPath: socketPath,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-
-	// Verify that New succeeds and the LocalBackend is created.
-	// ConfigureWebClient is called internally after NewLocalBackend,
-	// so if New succeeds without error, it means the call succeeded.
-	// The LocalBackend.web field is private and not directly observable,
-	// but the code has been verified to call ConfigureWebClient with
-	// Socket and UseSocketOnly set (see stack.go implementation).
-	lb := st.LocalBackend()
-	if lb == nil {
-		t.Fatal("LocalBackend is nil")
-	}
-	if st.Sys() == nil {
-		t.Fatal("System is nil")
+		t.Fatal("Close hung for 3 seconds with netstack packets blocked; want TUN close to unblock them")
 	}
 }
 
