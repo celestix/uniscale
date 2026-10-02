@@ -229,6 +229,63 @@ func TestUnreachable(t *testing.T) {
 	}
 }
 
+// TestUnreachableOddLength pins the checksum of ICMP errors whose message
+// has an odd length, which happens whenever the quoted packet has one.
+// net/packet's checksum gets odd lengths wrong (receivers such as gVisor
+// then drop the message), so unify computes its own; the independent
+// onesSum checks it here.
+func TestUnreachableOddLength(t *testing.T) {
+	const headroom = 16
+	// ipLen returns pkt with its IP length cut to n bytes.
+	ipLen := func(pkt []byte, n int) []byte {
+		pkt = bytes.Clone(pkt)
+		if pkt[0]>>4 == 4 {
+			binary.BigEndian.PutUint16(pkt[2:4], uint16(n))
+			fixIPv4Checksum(pkt)
+		} else {
+			binary.BigEndian.PutUint16(pkt[4:6], uint16(n-40))
+		}
+		return pkt[:n]
+	}
+	udp4 := udpPkt("100.64.0.2:5000", "100.64.9.9:53", nil)
+	udp6 := func(n int) []byte {
+		return udpPkt("[fd7a:115c:a1e0::2]:5000", "[fd7a:115c:a1e0::99]:53", bytes.Repeat([]byte{0xa5}, n))
+	}
+	var pkts [][]byte
+	for n := 20; n <= 28; n++ { // IPv4 quotes the header and up to 8 bytes
+		pkts = append(pkts, ipLen(udp4, n))
+	}
+	for n := range 12 {
+		pkts = append(pkts, udp6(n))
+	}
+	// Around the longest IPv6 quote: whole odd-length packets, and longer
+	// ones cut to the minimum MTU.
+	for n := ipv6MinMTU - 40 - 8 - 3; n <= ipv6MinMTU-40-8+2; n++ {
+		pkts = append(pkts, udp6(n-48))
+	}
+	odd := map[int]int{} // IP version -> odd-length messages seen
+	for _, pkt := range pkts {
+		if !wantsUnreachable(pkt) {
+			t.Fatalf("wantsUnreachable(% x) = false", pkt)
+		}
+		b := unreachable(pkt, headroom)[headroom:]
+		ver, hl := int(b[0]>>4), 20
+		if ver == 6 {
+			hl = 40
+		}
+		msg := len(b) - hl
+		if msg%2 == 1 {
+			odd[ver]++
+		}
+		if !checksumsOK(t, b) {
+			t.Errorf("IPv%d packet of %d bytes: ICMP error of %d bytes has a bad checksum: % x", ver, len(pkt), msg, b)
+		}
+	}
+	if odd[4] == 0 || odd[6] == 0 {
+		t.Fatalf("odd-length messages: %v, want some for IPv4 and IPv6", odd)
+	}
+}
+
 func TestWantsUnreachable(t *testing.T) {
 	udp4 := udpPkt("100.64.0.2:5000", "100.64.9.9:53", []byte("hello"))
 	udp6 := udpPkt("[fd7a:115c:a1e0::2]:5000", "[fd7a:115c:a1e0::99]:53", []byte("hello"))
