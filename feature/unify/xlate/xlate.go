@@ -202,7 +202,7 @@ func (t *Translator) Outbound(q *packet.Parsed) Result {
 		return drop(DropSourceNotAllowed)
 	}
 	p := plan{src: newSrc, dst: realDst}
-	if q.IsError() {
+	if isICMPError(q) {
 		var reason DropReason
 		if p.quote, reason = t.outboundQuote(ss, st, q); reason != 0 {
 			return drop(reason)
@@ -293,7 +293,7 @@ func (t *Translator) Inbound(owner remap.Owner, q *packet.Parsed) Result {
 		return drop(DropDestinationNotReachable)
 	}
 	p := plan{src: vsrc, dst: vdst}
-	if q.IsError() {
+	if isICMPError(q) {
 		var reason DropReason
 		if p.quote, reason = t.inboundQuote(ss, owner, q, dst, vdst); reason != 0 {
 			return drop(reason)

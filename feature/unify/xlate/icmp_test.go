@@ -84,6 +84,15 @@ func TestMalformedICMPErrors(t *testing.T) {
 			b[28] = 0x4f
 			return b
 		},
+		"icmp header cut short": func(b []byte) []byte {
+			// An error type with only 4 bytes of ICMP header and nothing
+			// quoted. net/packet's IsError would not call it an error.
+			b = b[:24]
+			binary.BigEndian.PutUint16(b[2:], 24)
+			b[10], b[11] = 0, 0
+			binary.BigEndian.PutUint16(b[10:], csum(b[:20]))
+			return b
+		},
 		"icmp header past ip length": func(b []byte) []byte {
 			// The buffer holds the full error, but the IP length ends
 			// 4 bytes into the ICMP header.
@@ -480,4 +489,102 @@ func TestOutboundICMPErrorQuotedDestination(t *testing.T) {
 		{name: "ipv6 another tailnet's self",
 			b: icmpErr("fd7a:115c:a1e0::77", "fd00:1::", pkt(ipproto.UDP, "[fd00:1::]:5000", "[fd7a:115c:a1e0::52]:53")), verdict: Drop},
 	})
+}
+
+// Review focus (R23): xlate classifies ICMP errors itself. net/packet's
+// ICMP4ParamProblem is 0x12 (18, address mask reply) instead of RFC 792's
+// 12, so Parsed.IsError misses real IPv4 parameter problems: their quotes
+// would keep the other side's addresses, and one tailnet could deliver an
+// error about another tailnet's flow.
+func TestICMPParameterProblem(t *testing.T) {
+	const ptr = 9 << 24 // points at the quoted packet's protocol field
+	runICMPErrors(t, scenario(t), []icmpErrCase{
+		{name: "inbound ipv4 quote translated", owner: "friends",
+			b:       icmpError(12, 0, ptr, "100.88.1.4", "100.99.0.1", pkt(ipproto.UDP, "100.99.0.1:5000", "100.88.1.4:53")),
+			verdict: ToHost, wantOwner: "friends",
+			wantSrc: "198.18.0.1", wantDst: "100.99.0.1", wantQSrc: "100.99.0.1", wantQDst: "198.18.0.1"},
+		{name: "outbound ipv4 quote translated",
+			b:       icmpError(12, 0, ptr, "100.99.0.1", "198.18.0.1", pkt(ipproto.UDP, "198.18.0.1:5000", "100.99.0.1:53")),
+			verdict: ToStack, wantOwner: "friends",
+			wantSrc: "100.99.0.1", wantDst: "100.88.1.4", wantQSrc: "100.88.1.4", wantQDst: "100.99.0.1"},
+		{name: "ipv4 missing-option code quote translated", owner: "friends",
+			b:       icmpError(12, 1, 0, "100.88.1.4", "100.99.0.1", pkt(ipproto.TCP, "100.99.0.1:5000", "100.88.1.4:443")),
+			verdict: ToHost, wantOwner: "friends",
+			wantSrc: "198.18.0.1", wantDst: "100.99.0.1", wantQSrc: "100.99.0.1", wantQDst: "198.18.0.1"},
+		{name: "inbound ipv4 cross-tailnet quote dropped", owner: "friends",
+			b: icmpError(12, 0, ptr, "100.88.1.4", "100.99.0.1", pkt(ipproto.UDP, "100.101.5.2:4000", "100.70.2.9:53")), verdict: Drop},
+		{name: "inbound ipv4 quote of another tailnet's peer dropped", owner: "friends",
+			b: icmpError(12, 0, ptr, "100.88.1.4", "100.99.0.1", pkt(ipproto.UDP, "100.99.0.1:4000", "100.70.2.9:53")), verdict: Drop},
+		{name: "outbound ipv4 cross-tailnet quote dropped",
+			b: icmpError(12, 0, ptr, "100.99.0.1", "198.18.0.1", pkt(ipproto.UDP, "100.88.1.4:5000", "100.99.0.1:53")), verdict: Drop},
+		{name: "inbound ipv6 quote translated", owner: "friends",
+			b:       icmpError(4, 0, 6, "fd7a:115c:a1e0::99", "fd7a:115c:a1e0::77", pkt(ipproto.UDP, "[fd7a:115c:a1e0::77]:5000", "[fd7a:115c:a1e0::99]:53")),
+			verdict: ToHost, wantOwner: "friends",
+			wantSrc: "fd00:1::", wantDst: "fd7a:115c:a1e0::77", wantQSrc: "fd7a:115c:a1e0::77", wantQDst: "fd00:1::"},
+		{name: "inbound ipv6 cross-tailnet quote dropped", owner: "friends",
+			b: icmpError(4, 0, 6, "fd7a:115c:a1e0::99", "fd7a:115c:a1e0::77", pkt(ipproto.UDP, "[fd7a:115c:a1e0::52]:4000", "[fd7a:115c:a1e0::99]:53")), verdict: Drop},
+	})
+}
+
+// Review focus (R23): ICMPv4 type 18 (address mask reply), which
+// net/packet counts as an error, carries no quoted packet. It is
+// translated like any other ICMP message rather than dropped as a
+// malformed error.
+func TestICMPAddressMaskReplyNotAnError(t *testing.T) {
+	tr := scenario(t)
+	mask := []byte{255, 255, 255, 0}
+	b := icmpError(18, 0, 0, "100.99.0.1", "198.18.0.1", mask)
+	if r := tr.Outbound(parse(b)); r.Verdict != ToStack || r.Owner != "friends" {
+		t.Fatalf("Outbound = %+v, want to-stack friends", r)
+	}
+	if s, d := addrs(b); s != mpa("100.99.0.1") || d != mpa("100.88.1.4") {
+		t.Fatalf("outer = %v -> %v, want 100.99.0.1 -> 100.88.1.4", s, d)
+	}
+	if !checksumsOK(b) {
+		t.Fatal("bad checksums")
+	}
+	b = icmpError(18, 0, 0, "100.88.1.4", "100.99.0.1", mask)
+	if r := tr.Inbound("friends", parse(b)); r.Verdict != ToHost {
+		t.Fatalf("Inbound = %+v, want to-host", r)
+	}
+	if s, d := addrs(b); s != mpa("198.18.0.1") || d != mpa("100.99.0.1") {
+		t.Fatalf("outer = %v -> %v, want 198.18.0.1 -> 100.99.0.1", s, d)
+	}
+}
+
+// isICMPError counts exactly the error types that quote a packet: ICMPv4
+// 3, 11 and 12 (RFC 792) and ICMPv6 1 to 4 (RFC 4443). Redirects and
+// source quench quote one too, but are dropped before classification.
+func TestIsICMPError(t *testing.T) {
+	want4 := map[int]bool{3: true, 11: true, 12: true}
+	want6 := map[int]bool{1: true, 2: true, 3: true, 4: true}
+	v4 := pkt(ipproto.UDP, "100.64.0.1:1", "100.64.0.2:2")
+	v6 := pkt(ipproto.UDP, "[fd7a:115c:a1e0::1]:1", "[fd7a:115c:a1e0::2]:2")
+	for typ := range 256 {
+		b := icmpError(byte(typ), 0, 0, "100.64.0.2", "100.64.0.1", v4)
+		if got := isICMPError(parse(b)); got != want4[typ] {
+			t.Errorf("ipv4 type %d: isICMPError = %v, want %v", typ, got, want4[typ])
+		}
+		b = icmpError(byte(typ), 0, 0, "fd7a:115c:a1e0::2", "fd7a:115c:a1e0::1", v6)
+		if got := isICMPError(parse(b)); got != want6[typ] {
+			t.Errorf("ipv6 type %d: isICMPError = %v, want %v", typ, got, want6[typ])
+		}
+	}
+	for name, b := range map[string][]byte{
+		"udp":      v4,
+		"tcp":      pkt(ipproto.TCP, "100.64.0.1:1", "100.64.0.2:2"),
+		"ipv6 udp": v6,
+	} {
+		if isICMPError(parse(b)) {
+			t.Errorf("%s: isICMPError = true", name)
+		}
+	}
+	// A Parsed claiming ICMP without an ICMP header (not produced by
+	// packet.Decode) is not an error and does not panic.
+	b := pkt(ipproto.ICMPv4, "100.64.0.1:0", "100.64.0.2:0")[:20]
+	q := parse(b)
+	q.IPProto = ipproto.ICMPv4
+	if isICMPError(q) {
+		t.Error("headerless ICMP: isICMPError = true")
+	}
 }

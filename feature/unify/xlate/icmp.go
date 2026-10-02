@@ -21,6 +21,37 @@ const (
 	icmp6Redirect     = 137 // RFC 4861
 )
 
+// ICMP errors that quote the packet that caused them (RFC 792, RFC 4443).
+// net/packet's Parsed.IsError is not used: its ICMP4ParamProblem is 0x12
+// (18, address mask reply) instead of 12, so it misses IPv4 parameter
+// problems, whose quotes would then go untranslated and unchecked.
+const (
+	icmp4Unreachable  = 3
+	icmp4TimeExceeded = 11
+	icmp4ParamProblem = 12
+	icmp6Unreachable  = 1
+	icmp6ParamProblem = 4 // 2 (packet too big) and 3 (time exceeded) lie between
+)
+
+// isICMPError reports whether q is an ICMP error quoting a packet: ICMPv4
+// destination unreachable, time exceeded or parameter problem, or ICMPv6
+// destination unreachable, packet too big, time exceeded or parameter
+// problem. Redirects and source quench also quote one, but they are
+// dropped before this is asked ([isRedirect]).
+func isICMPError(q *packet.Parsed) bool {
+	t := q.Transport()
+	if len(t) == 0 {
+		return false
+	}
+	switch q.IPProto {
+	case ipproto.ICMPv4:
+		return t[0] == icmp4Unreachable || t[0] == icmp4TimeExceeded || t[0] == icmp4ParamProblem
+	case ipproto.ICMPv6:
+		return t[0] >= icmp6Unreachable && t[0] <= icmp6ParamProblem
+	}
+	return false
+}
+
 // isRedirect reports whether q is an ICMPv4 redirect or source quench or
 // an ICMPv6 redirect.
 func isRedirect(q *packet.Parsed) bool {
