@@ -9,6 +9,7 @@ import (
 
 	"tailscale.com/ipn"
 	"tailscale.com/net/tsaddr"
+	"tailscale.com/syncs"
 )
 
 // RoutingSnapshot is a point-in-time view of what a LocalBackend
@@ -31,16 +32,18 @@ type RoutingSnapshot struct {
 	Subnets []netip.Prefix
 
 	// Advertised is the subnet routes this node advertises, without
-	// exit routes.
+	// exit routes or any /0.
 	Advertised []netip.Prefix
 
 	// OffersExit is whether this node advertises itself as an exit
 	// node (both the IPv4 and IPv6 exit routes).
 	OffersExit bool
 
-	// UsesExit is whether an exit node is selected and its exit routes
-	// are routed. A selected exit node that does not resolve to a
-	// current peer routes nothing, so UsesExit is false then.
+	// UsesExit is whether an exit node is selected (prefs ExitNodeID is
+	// non-empty or ExitNodeIP is valid), regardless of whether it
+	// resolves or whether exit routes are in the outbound table. This
+	// is fail-closed: unify routes /0 into the stack, which ignores it
+	// when no exit peer exists, matching stock tailscaled's blackhole.
 	UsesExit bool
 
 	// MagicDNSSuffix is the tailnet's MagicDNS suffix, without a
@@ -71,16 +74,12 @@ func (b *LocalBackend) RoutingSnapshot() RoutingSnapshot {
 
 	peers, routes := cn.routeMgr.OutboundPrefixes()
 	snap.Peers = peers
-	var exitRouted bool
 	for _, p := range routes {
-		if tsaddr.IsExitRoute(p) {
-			exitRouted = true
-		} else {
+		if !tsaddr.IsExitRoute(p) {
 			snap.Subnets = append(snap.Subnets, p)
 		}
 	}
-	exitSelected := prefs.ExitNodeID() != "" || prefs.ExitNodeIP().IsValid()
-	snap.UsesExit = exitSelected && exitRouted
+	snap.UsesExit = prefs.ExitNodeID() != "" || prefs.ExitNodeIP().IsValid()
 	return snap
 }
 
@@ -106,6 +105,7 @@ func (b *LocalBackend) SetRoutingObserver(f func()) {
 //
 // b.mu must be held.
 func (b *LocalBackend) notifyRoutingObserverLocked() {
+	syncs.RequiresMutex(&b.mu)
 	if f := b.routingObserver.Load(); f != nil {
 		f()
 	}

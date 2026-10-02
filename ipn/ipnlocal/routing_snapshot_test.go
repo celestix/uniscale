@@ -120,7 +120,8 @@ func TestRoutingSnapshot(t *testing.T) {
 				ExitNodeIDSet: true,
 			},
 			want: RoutingSnapshot{
-				Peers: routingTestPeers,
+				Peers:    routingTestPeers,
+				UsesExit: true,
 			},
 		},
 		{
@@ -130,7 +131,8 @@ func TestRoutingSnapshot(t *testing.T) {
 				ExitNodeIDSet: true,
 			},
 			want: RoutingSnapshot{
-				Peers: routingTestPeers,
+				Peers:    routingTestPeers,
+				UsesExit: true,
 			},
 		},
 		{

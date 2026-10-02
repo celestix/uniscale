@@ -1086,6 +1086,7 @@ func (b *LocalBackend) setStateLocked(state ipn.State) {
 	for _, f := range b.extHost.Hooks().BackendStateChange {
 		f(state)
 	}
+	b.notifyRoutingObserverLocked()
 }
 
 func (b *LocalBackend) IPServiceMappings() netmap.IPServiceMappings {
@@ -6862,7 +6863,6 @@ func (b *LocalBackend) enterStateLocked(newState ipn.State) {
 	if oldState == newState {
 		return
 	}
-	defer b.notifyRoutingObserverLocked()
 
 	b.logf("Switching ipn state %v -> %v (WantRunning=%v, nm=%v)",
 		oldState, newState, prefs.WantRunning(), netMap != nil)
