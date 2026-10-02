@@ -225,7 +225,8 @@ func serveGreeting(t *testing.T, greeting string) string {
 
 // runInNetns runs test name of this test binary in a new user and network
 // namespace, with netnsEnv set, and fails if it does not pass there. It
-// skips if the system cannot make such namespaces.
+// skips if the system cannot make such namespaces, or the test skips in
+// one.
 func runInNetns(t *testing.T, name string) {
 	unshare, err := exec.LookPath("unshare")
 	if err != nil {
@@ -237,7 +238,11 @@ func runInNetns(t *testing.T, name string) {
 	cmd := exec.CommandContext(t.Context(), unshare, "-rn", os.Args[0], "-test.run=^"+name+"$", "-test.count=1", "-test.v")
 	cmd.Env = append(os.Environ(), netnsEnv+"=1")
 	out, err := cmd.CombinedOutput()
-	if err != nil || !bytes.Contains(out, []byte("--- PASS: "+name+" ")) {
+	switch {
+	case err == nil && bytes.Contains(out, []byte("--- PASS: "+name+" ")):
+	case err == nil && bytes.Contains(out, []byte("--- SKIP: "+name+" ")):
+		t.Skipf("%s skipped in a network namespace:\n%s", name, out)
+	default:
 		t.Fatalf("%s in a network namespace: %v\n%s", name, err, out)
 	}
 	for line := range strings.Lines(string(out)) {
@@ -277,7 +282,7 @@ func addDummy(t *testing.T, name string, addrs ...netip.Prefix) netlink.Link {
 	t.Helper()
 	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: name}}
 	if err := netlink.LinkAdd(link); err != nil {
-		t.Fatalf("adding %s: %v", name, err)
+		t.Skipf("cannot add dummy interface %s: %v", name, err)
 	}
 	if err := netlink.LinkSetUp(link); err != nil {
 		t.Fatal(err)
