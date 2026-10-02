@@ -16,9 +16,11 @@ import (
 //   - live mappings never change (stickiness);
 //   - RealToVirtual and VirtualToReal are inverses for every mapping;
 //   - a block quarantined for one (owner, real) is never assigned to
-//     another while its quarantine is active;
+//     another while its quarantine is active, except that an identity
+//     block taken back may overlap its owner's quarantined identity blocks;
 //   - an (owner, real) that returns while its last block is quarantined
-//     gets that block back if it is otherwise free.
+//     gets that block back if it is otherwise free, and is then never
+//     reported unmapped.
 //
 // Each step is 5 bytes: op and owner, prefix length, two address bytes, and
 // how far the clock moves forward.
@@ -37,6 +39,16 @@ func FuzzSyncInvariants(f *testing.F) {
 		0x72, 0, 0, 0, 60, // +5h, RemoveOwner(c)
 		0x60, 0, 0, 0, 0, // Expire: ended quarantines forgotten
 		0x02, 8, 1, 0, 0, // c returns after its quarantine ended
+	})
+	// Nested identity blocks of one owner, released together, then taken
+	// back one by one (C2). The /16 does not fit the pool, so refusing it
+	// its block reports it unmapped.
+	f.Add([]byte{
+		0x00, 0, 0, 0, 0, // a syncs 10.0.0.0/16 (identity)
+		0x00, 8, 1, 0, 0, // a syncs 10.0.1.0/24 (identity, nested)
+		0x70, 0, 0, 0, 0, // RemoveOwner(a): both quarantined
+		0x00, 0, 0, 0, 1, // a returns with 10.0.0.0/16: identity again
+		0x00, 8, 1, 0, 0, // and with 10.0.1.0/24: identity again
 	})
 	f.Fuzz(func(t *testing.T, data []byte) {
 		cfg := testConfig()
@@ -106,6 +118,12 @@ func FuzzSyncInvariants(f *testing.F) {
 				for _, m := range ch.Added {
 					checkQuarantine(t, m, before, quar, now)
 				}
+				for _, p := range ch.Unmapped {
+					k := key{owner, p}
+					if last := lastQuarantined(k, quar, now); last.IsValid() && otherwiseFree(k, last, before, quar, now) {
+						t.Fatalf("Sync reported %v unmapped for %s; want its quarantined block %v back", p, owner, last)
+					}
+				}
 			}
 			checkTable(t, tb, seen)
 		}
@@ -118,34 +136,45 @@ func FuzzSyncInvariants(f *testing.F) {
 func checkQuarantine(t *testing.T, m Mapping, before []Mapping, quar map[netip.Prefix]released, now time.Time) {
 	t.Helper()
 	k := key{m.Owner, m.Real}
-	var last netip.Prefix // k's most recently released, still quarantined block
+	last := lastQuarantined(k, quar, now)
+	reclaimed := last.IsValid() && m.Virtual == last
 	for v, r := range quar {
-		if !now.Before(r.until) {
+		if r.key == k || !now.Before(r.until) || !v.Overlaps(m.Virtual) {
 			continue
 		}
-		if r.key != k {
-			if v.Overlaps(m.Virtual) {
-				t.Fatalf("Sync assigned %v, overlapping %v quarantined for %v until %v", m, v, r.key, r.until)
-			}
+		if reclaimed && identityExempt(k, last, r.key, v) {
+			continue
+		}
+		t.Fatalf("Sync assigned %v, overlapping %v quarantined for %v until %v", m, v, r.key, r.until)
+	}
+	if !last.IsValid() || !otherwiseFree(k, last, before, quar, now) {
+		return
+	}
+	if !reclaimed {
+		t.Fatalf("Sync mapped %v; want its quarantined block %v back", m, last)
+	}
+	delete(quar, last)
+}
+
+// lastQuarantined returns k's most recently released block that is still
+// quarantined, or the zero prefix.
+func lastQuarantined(k key, quar map[netip.Prefix]released, now time.Time) netip.Prefix {
+	var last netip.Prefix
+	for v, r := range quar {
+		if r.key != k || !now.Before(r.until) {
 			continue
 		}
 		if l := quar[last]; !last.IsValid() || r.until.After(l.until) || r.until.Equal(l.until) && comparePrefix(v, last) < 0 {
 			last = v
 		}
 	}
-	if !last.IsValid() || !otherwiseFree(k, last, before, quar, now) {
-		return
-	}
-	if m.Virtual != last {
-		t.Fatalf("Sync mapped %v; want its quarantined block %v back", m, last)
-	}
-	delete(quar, last)
+	return last
 }
 
 // otherwiseFree reports whether v is free for k apart from k's own
-// quarantine: no live mapping overlaps it (k's owner's identity mappings
-// may, if v is an identity block) and no block quarantined for another
-// (owner, real) does.
+// quarantine: no live mapping and no block quarantined for another (owner,
+// real) overlaps it, except, if v is an identity block, k's owner's
+// identity mappings and quarantined identity blocks.
 func otherwiseFree(k key, v netip.Prefix, live []Mapping, quar map[netip.Prefix]released, now time.Time) bool {
 	ident := v == k.real
 	for _, m := range live {
@@ -154,11 +183,18 @@ func otherwiseFree(k key, v netip.Prefix, live []Mapping, quar map[netip.Prefix]
 		}
 	}
 	for q, r := range quar {
-		if r.key != k && now.Before(r.until) && q.Overlaps(v) {
+		if r.key != k && now.Before(r.until) && q.Overlaps(v) && !identityExempt(k, v, r.key, q) {
 			return false
 		}
 	}
 	return true
+}
+
+// identityExempt reports whether q, a block quarantined for qk, may
+// overlap v when k takes v back: both are identity blocks of one owner,
+// which may overlap as that owner's live identity mappings may.
+func identityExempt(k key, v netip.Prefix, qk key, q netip.Prefix) bool {
+	return v == k.real && q == qk.real && qk.owner == k.owner
 }
 
 // checkTable checks the invariants that hold after every step.

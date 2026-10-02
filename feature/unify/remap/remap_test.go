@@ -416,6 +416,41 @@ func TestQuarantineReclaim(t *testing.T) {
 		mustSync(t, tb, "personal", t0, "10.3.0.0/16")
 		wantVirtual(t, tb, "personal", "10.3.0.1", "198.18.0.1")
 	})
+	t.Run("nested identity blocks of one owner", func(t *testing.T) {
+		// Review focus (C2): an owner routing 10.0.0.0/8 and 10.1.0.0/16
+		// holds two overlapping identity blocks, as same-owner identity
+		// mappings may. Released together, neither may keep the other out
+		// when the owner returns during the quarantine.
+		for _, order := range [][]string{
+			{"10.0.0.0/8", "10.1.0.0/16"},
+			{"10.1.0.0/16", "10.0.0.0/8"},
+		} {
+			tb := newTable(t, cfg, &memStore{})
+			mustSync(t, tb, "work", t0, "10.0.0.0/8", "10.1.0.0/16")
+			if _, err := tb.RemoveOwner("work", t0); err != nil {
+				t.Fatal(err)
+			}
+			ch := mustSync(t, tb, "work", t0.Add(time.Minute), order...)
+			if len(ch.Added) != 2 || len(ch.Unmapped) != 0 {
+				t.Fatalf("%v: Sync = %+v, want both added", order, ch)
+			}
+			wantVirtual(t, tb, "work", "10.2.0.1", "10.2.0.1")
+			wantVirtual(t, tb, "work", "10.1.0.1", "10.1.0.1")
+			// Both blocks left quarantine: another owner is kept out by
+			// the live mappings, as usual.
+			mustSync(t, tb, "personal", t0.Add(time.Minute), "10.1.2.0/24")
+			wantVirtual(t, tb, "personal", "10.1.2.3", "198.18.0.3")
+		}
+	})
+	t.Run("nested identity blocks returning one at a time", func(t *testing.T) {
+		tb := newTable(t, cfg, &memStore{})
+		mustSync(t, tb, "work", t0, "10.0.0.0/8", "10.1.0.0/16")
+		tb.RemoveOwner("work", t0)
+		mustSync(t, tb, "work", t0.Add(time.Minute), "10.1.0.0/16")
+		wantVirtual(t, tb, "work", "10.1.0.1", "10.1.0.1")
+		mustSync(t, tb, "work", t0.Add(2*time.Minute), "10.0.0.0/8")
+		wantVirtual(t, tb, "work", "10.2.0.1", "10.2.0.1")
+	})
 	t.Run("most recent block is reclaimed", func(t *testing.T) {
 		// work's 10.0.0.0/24 is released twice while its first block is
 		// still quarantined: it takes back the block it held last.
@@ -464,6 +499,50 @@ func TestQuarantineReclaim(t *testing.T) {
 		wantVirtual(t, tb, "a", "10.0.1.7", "198.18.1.7")
 		if err := checkDisjoint(tb.Mappings()); err != nil {
 			t.Fatal(err)
+		}
+	})
+	t.Run("identity exception is narrow", func(t *testing.T) {
+		// Saved states the table would not produce, so each case isolates
+		// one overlapping quarantined block. Only the same owner's
+		// identity blocks may overlap a reclaimed identity block.
+		until := t0.Add(time.Hour).Format(time.RFC3339)
+		q := func(virtual, owner, real string) string {
+			return `{"virtual":"` + virtual + `","owner":"` + owner + `","real":"` + real + `","until":"` + until + `"}`
+		}
+		for _, c := range []struct {
+			name string
+			quar []string
+			sync string
+			want string // virtual prefix, or "" for unmapped
+		}{
+			{"same owner's identity block", []string{q("10.0.0.0/8", "a", "10.0.0.0/8"), q("10.1.0.0/16", "a", "10.1.0.0/16")},
+				"10.0.0.0/8", "10.0.0.0/8"},
+			{"same owner's remapped block", []string{q("10.0.0.0/8", "a", "10.0.0.0/8"), q("10.1.0.0/16", "a", "172.16.0.0/16")},
+				"10.0.0.0/8", ""},
+			{"another owner's identity block", []string{q("10.0.0.0/8", "a", "10.0.0.0/8"), q("10.1.0.0/16", "b", "10.1.0.0/16")},
+				"10.0.0.0/8", ""},
+			// Not taken back: a's remapped block is not an identity block.
+			// 192.168.1.0/24 itself is free, so it is mapped as identity.
+			{"remapped block, same owner's identity block", []string{q("198.18.0.0/24", "a", "192.168.1.0/24"), q("198.18.0.0/16", "a", "198.18.0.0/16")},
+				"192.168.1.0/24", "192.168.1.0/24"},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				st := &memStore{data: []byte(`{"version":1,"quarantine":[` + strings.Join(c.quar, ",") + `]}`)}
+				tb := newTable(t, cfg, st)
+				if err := tb.LoadErr(); err != nil {
+					t.Fatal(err)
+				}
+				ch := mustSync(t, tb, "a", t0, c.sync)
+				if c.want == "" {
+					if len(ch.Unmapped) != 1 {
+						t.Fatalf("Sync = %+v, want %s unmapped (pool too small)", ch, c.sync)
+					}
+					return
+				}
+				if len(ch.Added) != 1 || ch.Added[0].Virtual != mpp(c.want) {
+					t.Fatalf("Sync = %+v, want %s -> %s", ch, c.sync, c.want)
+				}
+			})
 		}
 	})
 	t.Run("persisted with owner and real", func(t *testing.T) {

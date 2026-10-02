@@ -267,8 +267,10 @@ func (t *Table) SetLocal(prefixes []netip.Prefix) []Conflict {
 // they expire (see [Table.Expire]). Default routes are never mapped.
 //
 // A prefix whose previous mapping was released and whose block is still
-// quarantined takes that block back if nothing else now overlaps it; no
-// other owner or prefix may use a quarantined block.
+// quarantined takes that block back if nothing else now overlaps it; an
+// identity block may overlap the owner's own identity mappings and
+// quarantined identity blocks. Any other new mapping gets a block that
+// overlaps no quarantined one.
 //
 // The returned error reports a failure to persist; the in-memory table is
 // updated regardless.
@@ -406,8 +408,10 @@ func (t *Table) reclaimableLocked(owner Owner, now time.Time) map[netip.Prefix]n
 // reclaimLocked reports whether k may take back v, the block it held
 // before it was released, and if so takes v out of quarantine. v must be
 // otherwise free: no mapping, local network, or block quarantined for
-// another (owner, real) overlaps it, except k's owner's own identity
-// mappings when v is an identity block.
+// another (owner, real) overlaps it, except, when v is an identity block,
+// k's owner's own identity mappings and quarantined identity blocks (an
+// owner's identity blocks may overlap, for example 10.0.0.0/8 and
+// 10.1.0.0/16, and are released together by [Table.RemoveOwner]).
 func (t *Table) reclaimLocked(k key, v netip.Prefix, now time.Time) bool {
 	ident := v == k.real
 	for _, m := range t.mappings {
@@ -421,7 +425,8 @@ func (t *Table) reclaimLocked(k key, v netip.Prefix, now time.Time) bool {
 		}
 	}
 	for p, r := range t.quarantine {
-		if r.key != k && now.Before(r.until) && p.Overlaps(v) {
+		ownIdent := ident && r.key.owner == k.owner && p == r.key.real
+		if r.key != k && now.Before(r.until) && p.Overlaps(v) && !ownIdent {
 			return false
 		}
 	}
