@@ -304,6 +304,8 @@ type LocalBackend struct {
 
 	peerAPIPorts syncs.AtomicValue[map[netip.Addr]int] // can be read without b.mu held; TODO(nickkhyl): remove or move to nodeBackend?
 
+	routingObserver syncs.AtomicValue[func()] // see SetRoutingObserver; nil if unset
+
 	// The mutex protects the following elements.
 	mu syncs.Mutex
 
@@ -6114,6 +6116,7 @@ func (b *LocalBackend) authReconfig() {
 //
 // b.mu must be held.
 func (b *LocalBackend) authReconfigLocked() {
+	defer b.notifyRoutingObserverLocked()
 	if b.shutdownCalled {
 		b.logf("[v1] authReconfig: skipping because in shutdown")
 		return
@@ -6859,6 +6862,7 @@ func (b *LocalBackend) enterStateLocked(newState ipn.State) {
 	if oldState == newState {
 		return
 	}
+	defer b.notifyRoutingObserverLocked()
 
 	b.logf("Switching ipn state %v -> %v (WantRunning=%v, nm=%v)",
 		oldState, newState, prefs.WantRunning(), netMap != nil)

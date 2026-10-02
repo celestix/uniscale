@@ -940,3 +940,78 @@ func TestExitNodeBlackhole(t *testing.T) {
 	commit(rm, func(m *Mutation) { m.SetPrefs(Prefs{}) })
 	wantOSRoutes(t, rm)
 }
+
+func TestOutboundPrefixes(t *testing.T) {
+	rm := New(t.Logf)
+	p2 := peer2()
+	p2.Routes = []netip.Prefix{pfx("10.0.0.0/24"), pfx("0.0.0.0/0"), pfx("::/0")}
+	// peer3 routes peer1's IPv4 address and a subnet of its own.
+	p3 := peerView{
+		ID:     3,
+		Key:    k3,
+		Routes: []netip.Prefix{pfx("100.64.0.1/32"), pfx("192.168.7.0/24")},
+	}
+	commit(rm, func(m *Mutation) {
+		m.upsertPeer(peer1())
+		m.upsertPeer(p2)
+		m.upsertPeer(p3)
+	})
+
+	want := func(step string, wantAddrs, wantRoutes []string) {
+		t.Helper()
+		toPfxs := func(ss []string) []netip.Prefix {
+			var out []netip.Prefix
+			for _, s := range ss {
+				out = append(out, pfx(s))
+			}
+			return out
+		}
+		addrs, routes := rm.OutboundPrefixes()
+		if !slices.Equal(addrs, toPfxs(wantAddrs)) {
+			t.Errorf("%s: addrs = %v; want %v", step, addrs, wantAddrs)
+		}
+		if !slices.Equal(routes, toPfxs(wantRoutes)) {
+			t.Errorf("%s: routes = %v; want %v", step, routes, wantRoutes)
+		}
+		// Every reported prefix must be in the outbound table.
+		for _, p := range append(addrs, routes...) {
+			if _, ok := rm.Outbound().Get(p); !ok {
+				t.Errorf("%s: %v reported but not in Outbound", step, p)
+			}
+		}
+	}
+	allAddrs := []string{"100.64.0.1/32", "100.64.0.2/32", "fd7a:115c:a1e0::1/128", "fd7a:115c:a1e0::2/128"}
+
+	want("default prefs", allAddrs, nil)
+
+	commit(rm, func(m *Mutation) { m.SetPrefs(Prefs{RouteAll: true}) })
+	// peer3's route to peer1's address is reported as an address only.
+	want("route all", allAddrs, []string{"10.0.0.0/24", "192.168.7.0/24"})
+
+	commit(rm, func(m *Mutation) { m.SetPrefs(Prefs{RouteAll: true, ExitNodeID: 2, ExitNodeSelected: true}) })
+	want("exit node", allAddrs, []string{"0.0.0.0/0", "10.0.0.0/24", "192.168.7.0/24", "::/0"})
+
+	// Extras are in the outbound table but in neither result, even a
+	// single Tailscale ULA address and a prefix another peer routes
+	// while RouteAll is off.
+	commit(rm, func(m *Mutation) {
+		m.SetPrefs(Prefs{})
+		m.SetExtraAllowedIPs(map[tailcfg.NodeID][]netip.Prefix{
+			1: {pfx("fd7a:115c:a1e0:a99c:200::5/128"), pfx("169.254.0.5/32"), pfx("10.0.0.0/24")},
+		})
+	})
+	wantOutbound(t, rm, "fd7a:115c:a1e0:a99c:200::5", k1, true)
+	wantOutbound(t, rm, "10.0.0.5", k1, true)
+	want("extras", allAddrs, nil)
+
+	// Ineligible self addresses are not reported.
+	commit(rm, func(m *Mutation) { m.SetTailnetConfig(TailnetConfig{DisableIPv4: true}) })
+	want("disable IPv4", []string{"fd7a:115c:a1e0::1/128", "fd7a:115c:a1e0::2/128"}, nil)
+
+	commit(rm, func(m *Mutation) {
+		m.RemovePeer(1)
+		m.RemovePeer(2)
+		m.RemovePeer(3)
+	})
+	want("no peers", nil, nil)
+}

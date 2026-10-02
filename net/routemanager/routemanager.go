@@ -296,6 +296,37 @@ func (rm *RouteManager) peerAllowedIPsLocked(id tailcfg.NodeID) (pfxs []netip.Pr
 	return pfxs, true
 }
 
+// OutboundPrefixes splits the outbound table by how peers contribute
+// each prefix: addrs are peers' own addresses and routes are accepted
+// advertised routes, including the selected exit node's exit routes.
+// A prefix that one peer contributes as an address and another as a
+// route is in addrs only. Prefixes that are only extra allowed IPs
+// (see [Mutation.SetExtraAllowedIPs]) are in neither. Both results are
+// sorted.
+//
+// Like PeerAllowedIPs, it reads the working state under an internal
+// mutex, so it is safe to call concurrently with Commit.
+func (rm *RouteManager) OutboundPrefixes() (addrs, routes []netip.Prefix) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	for pfx, contribs := range rm.byPrefix {
+		var isAddr, isRoute bool
+		for id, kind := range contribs {
+			isAddr = isAddr || rm.eligible(id, pfx, kind&kindSelf)
+			isRoute = isRoute || rm.eligible(id, pfx, kind&kindRoute)
+		}
+		switch {
+		case isAddr:
+			addrs = append(addrs, pfx)
+		case isRoute:
+			routes = append(routes, pfx)
+		}
+	}
+	tsaddr.SortPrefixes(addrs)
+	tsaddr.SortPrefixes(routes)
+	return addrs, routes
+}
+
 // Result describes what a Commit changed.
 type Result struct {
 	// PeersUpserted is the number of UpsertPeer operations applied.
