@@ -118,10 +118,11 @@ func (f *fakeStack) set(snap ipnlocal.RoutingSnapshot, captured *router.Config) 
 	f.mu.Lock()
 	f.snap = snap
 	obs := f.observer
-	f.mu.Unlock()
+	// Call observer while still holding lock, as LocalBackend calls it under b.mu.
 	if obs != nil {
 		obs()
 	}
+	f.mu.Unlock()
 }
 
 // notify calls the observer without changing anything.
@@ -1028,6 +1029,12 @@ func TestRemapPersisted(t *testing.T) {
 	h.waitRouter("primary", func(c *router.Config) bool { return len(c.LocalAddrs) == 2 })
 	h.stack("b").set(snap, nil)
 	before := h.waitRouter("both", func(c *router.Config) bool { return len(c.LocalAddrs) == 4 })
+
+	// Record virtual addresses for each tailnet before restart.
+	primarySelfBefore := h.virtual(remap.Owner(PrimaryName), mpa("100.64.0.1"))
+	primaryPeerBefore := h.virtual(remap.Owner(PrimaryName), mpa("100.64.0.2"))
+	bSelfBefore := h.virtual(remap.Owner("b"), mpa("100.64.0.1"))
+	bPeerBefore := h.virtual(remap.Owner("b"), mpa("100.64.0.2"))
 	h.u.Close()
 
 	h2 := mustHarness(t, func(h2 *harness) { h2.opts.StateDir = h.opts.StateDir; h2.opts.Pool6 = netip.Prefix{} })
@@ -1038,6 +1045,20 @@ func TestRemapPersisted(t *testing.T) {
 	after := h2.waitRouter("both", func(c *router.Config) bool { return len(c.LocalAddrs) == 4 })
 	if !after.Equal(before) {
 		t.Errorf("after restart\n got %+v\nwant %+v", after, before)
+	}
+
+	// Verify virtual addresses are unchanged for each tailnet.
+	if got := h2.virtual(remap.Owner(PrimaryName), mpa("100.64.0.1")); got != primarySelfBefore {
+		t.Errorf("primary self: got %v, want %v", got, primarySelfBefore)
+	}
+	if got := h2.virtual(remap.Owner(PrimaryName), mpa("100.64.0.2")); got != primaryPeerBefore {
+		t.Errorf("primary peer: got %v, want %v", got, primaryPeerBefore)
+	}
+	if got := h2.virtual(remap.Owner("b"), mpa("100.64.0.1")); got != bSelfBefore {
+		t.Errorf("b self: got %v, want %v", got, bSelfBefore)
+	}
+	if got := h2.virtual(remap.Owner("b"), mpa("100.64.0.2")); got != bPeerBefore {
+		t.Errorf("b peer: got %v, want %v", got, bPeerBefore)
 	}
 }
 
@@ -1063,7 +1084,7 @@ func TestCloseOrder(t *testing.T) {
 	if err := h.u.Close(); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"tun", "stack " + PrimaryName, "stack b", "router", "dns"}
+	want := []string{"stack " + PrimaryName, "stack b", "router", "dns", "tun"}
 	if got := h.events.get(); !slices.Equal(got, want) {
 		t.Errorf("close order %q, want %q", got, want)
 	}

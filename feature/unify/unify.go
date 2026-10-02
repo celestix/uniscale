@@ -355,7 +355,7 @@ func (u *Unify) addTailnet(build func(stack.Config) (tailnetStack, error), name 
 	if err != nil {
 		return err
 	}
-	r := osglue.NewRouter(nil)
+	r := osglue.NewRouter(u.routingChanged)
 	cfg.Name = name
 	cfg.Logf = u.logf
 	cfg.Tun, cfg.Router, cfg.DNS = dev, r, d
@@ -433,9 +433,9 @@ func (u *Unify) Start() error {
 	return nil
 }
 
-// Close stops the worker and the packet loop (closing the host's TUN),
-// closes every stack, then the host router and DNS configurator. It is
-// safe to call more than once.
+// Close stops the worker, closes every stack, then the host router and DNS
+// configurator, and finally closes the packet loop (closing the host's TUN).
+// It is safe to call more than once.
 func (u *Unify) Close() error {
 	u.closeOnce.Do(func() {
 		u.mu.Lock()
@@ -451,11 +451,6 @@ func (u *Unify) Close() error {
 		}
 
 		var errs []error
-		if u.loop != nil {
-			errs = append(errs, u.loop.Close())
-		} else if u.hostTUN != nil {
-			errs = append(errs, u.hostTUN.Close())
-		}
 		for _, t := range u.tailnets {
 			errs = append(errs, t.st.Close())
 		}
@@ -467,6 +462,11 @@ func (u *Unify) Close() error {
 		}
 		if u.hostDNS != nil {
 			errs = append(errs, u.hostDNS.Close())
+		}
+		if u.loop != nil {
+			errs = append(errs, u.loop.Close())
+		} else if u.hostTUN != nil {
+			errs = append(errs, u.hostTUN.Close())
 		}
 		u.closeErr = errors.Join(errs...)
 	})
