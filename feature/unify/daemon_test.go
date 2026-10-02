@@ -8,6 +8,7 @@ package unify
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"net"
 	"net/http"
@@ -58,6 +59,7 @@ type daemonHarness struct {
 
 	mu        sync.Mutex
 	created   []string // what host created, in order
+	linkUps   []string // each linkUp call, with the router's state
 	listeners map[string]*eventListener
 }
 
@@ -119,6 +121,17 @@ func newDaemonHarness(t *testing.T, config string) *daemonHarness {
 			}
 			h.record("dns")
 			return h.dns, nil
+		},
+		linkUp: func(dev tun.Device, logf logger.Logf) {
+			h.router.mu.Lock()
+			ups := h.router.ups
+			h.router.mu.Unlock()
+			if d, ok := dev.(eventTUN); !ok || d.Device != h.dev || logf == nil {
+				t.Errorf("linkUp(%v, %v), want the host TUN and tailscaled's logf", dev, logf)
+			}
+			h.mu.Lock()
+			h.linkUps = append(h.linkUps, fmt.Sprintf("router-ups=%d", ups))
+			h.mu.Unlock()
 		},
 		listen: func(path string) (net.Listener, error) {
 			ln, err := safesocket.Listen(path)
@@ -387,6 +400,13 @@ func TestDaemon(t *testing.T) {
 	}
 	if want := []string{"listen tailscaled.sock", "listen tailscaled-b.sock", "tun unify0", "router", "dns"}; !slices.Equal(h.getCreated(), want) {
 		t.Errorf("created %q, want %q", h.getCreated(), want)
+	}
+	// The host TUN's link features were set once, after the router came up.
+	h.mu.Lock()
+	linkUps := slices.Clone(h.linkUps)
+	h.mu.Unlock()
+	if want := []string{"router-ups=1"}; !slices.Equal(linkUps, want) {
+		t.Errorf("linkUp calls = %q, want %q", linkUps, want)
 	}
 	if n := len(h.events.get()); n != 0 {
 		t.Errorf("closed %q while running", h.events.get())

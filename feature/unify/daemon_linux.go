@@ -43,5 +43,11 @@ var osHost = hostDeps{
 	newDNS: func(logf logger.Logf, sys *tsd.System, devName string) (dns.OSConfigurator, error) {
 		return dns.NewOSConfigurator(logf, sys.HealthTracker.Get(), sys.Bus.Get(), sys.PolicyClientOrDefault(), sys.ControlKnobs(), devName)
 	},
+	// The host TUN gets tailscaled's GRO environment knobs and probe, as
+	// tstun.Wrapper does. The control-plane knobs are per tailnet, so
+	// none are applied.
+	linkUp: func(dev tun.Device, logf logger.Logf) {
+		tstun.SetDeviceLinkFeaturesPostUp(dev, nil, logf)
+	},
 	listen: safesocket.Listen,
 }

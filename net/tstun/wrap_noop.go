@@ -5,8 +5,15 @@
 
 package tstun
 
-import "tailscale.com/control/controlknobs"
+import (
+	"github.com/tailscale/wireguard-go/tun"
+	"tailscale.com/control/controlknobs"
+	"tailscale.com/types/logger"
+)
 
 func (t *Wrapper) SetLinkFeaturesPostUp(_ *controlknobs.Knobs) {}
+
+// SetDeviceLinkFeaturesPostUp does nothing on this platform or build.
+func SetDeviceLinkFeaturesPostUp(_ tun.Device, _ *controlknobs.Knobs, _ logger.Logf) {}
 
 func (t *Wrapper) ApplyGROKnobs(_ *controlknobs.Knobs) {}

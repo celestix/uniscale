@@ -76,6 +76,14 @@ type Options struct {
 	// Unify closes it, even if New fails.
 	HostRouter router.Router
 
+	// HostLinkUp, if not nil, is called by Start once, with HostTUN, after
+	// HostRouter is up and before any stack starts. The daemon uses it to
+	// apply tailscaled's GRO environment knobs and probe (see
+	// [tstun.SetDeviceLinkFeaturesPostUp]), which need the link up. The
+	// control-plane GRO knobs are per stack, so they are not applied to
+	// the shared HostTUN.
+	HostLinkUp func(dev tun.Device)
+
 	// HostBus is the event bus HostRouter was created on. The primary
 	// stack's magicsock port updates are published on it, so the router
 	// can let that port bypass the tunnel. The other stacks' ports are
@@ -202,7 +210,8 @@ type Unify struct {
 	hostTUN    tun.Device
 	hostRouter router.Router
 	hostDNS    dns.OSConfigurator
-	portClient *eventbus.Client // publishes the primary's port updates; nil without Options.HostBus
+	hostLinkUp func(dev tun.Device) // Options.HostLinkUp
+	portClient *eventbus.Client     // publishes the primary's port updates; nil without Options.HostBus
 	netMon     *netmon.Monitor
 
 	// localPrefixes returns the host's networks, or is nil.
@@ -255,6 +264,7 @@ func newUnify(opts Options, build func(stack.Config) (tailnetStack, error)) (_ *
 		hostTUN:     opts.HostTUN,
 		hostRouter:  opts.HostRouter,
 		hostDNS:     opts.HostDNS,
+		hostLinkUp:  opts.HostLinkUp,
 		netMon:      opts.NetMon,
 		settle:      settleDelay,
 		changed:     make(chan struct{}, 1),
@@ -411,6 +421,10 @@ func (u *Unify) Start() error {
 
 	if err := u.hostRouter.Up(); err != nil {
 		return fmt.Errorf("unify: bringing up the host router: %w", err)
+	}
+	// The link is up now, which the GRO probe needs.
+	if u.hostLinkUp != nil {
+		u.hostLinkUp(u.hostTUN)
 	}
 	u.refreshLocal()
 	u.mu.Lock()

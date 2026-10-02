@@ -18,6 +18,7 @@ import (
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/envknob"
 	"tailscale.com/net/tsaddr"
+	"tailscale.com/types/logger"
 )
 
 // SetLinkFeaturesPostUp configures link features on t based on select TS_TUN_
@@ -25,10 +26,30 @@ import (
 // nil), and OS feature tests. Callers should ensure t is up prior to calling,
 // otherwise OS feature tests may be inconclusive.
 func (t *Wrapper) SetLinkFeaturesPostUp(knobs *controlknobs.Knobs) {
-	if t.isTAP || runtime.GOOS == "android" {
+	if t.isTAP {
 		return
 	}
-	if groDev, ok := t.tdev.(tun.GRODevice); ok {
+	setLinkFeaturesPostUp(t.tdev, knobs, t.logf)
+}
+
+// SetDeviceLinkFeaturesPostUp does for the raw TUN device dev what
+// [Wrapper.SetLinkFeaturesPostUp] does for a Wrapper's: it applies the
+// TS_TUN_DISABLE_UDP_GRO and TS_TUN_DISABLE_TCP_GRO environment variables and
+// the control-plane GRO knobs (knobs may be nil, as it is when dev is shared
+// by several tailnets, whose knobs are per tailnet), then probes for the
+// kernel bug that makes GRO writes fail with EINVAL and disables GRO if it
+// finds it. dev must be up, otherwise the probe may be inconclusive. It does
+// nothing if dev does not support GRO, and on other platforms than Linux.
+func SetDeviceLinkFeaturesPostUp(dev tun.Device, knobs *controlknobs.Knobs, logf logger.Logf) {
+	setLinkFeaturesPostUp(dev, knobs, logf)
+}
+
+// setLinkFeaturesPostUp is the implementation of both.
+func setLinkFeaturesPostUp(dev tun.Device, knobs *controlknobs.Knobs, logf logger.Logf) {
+	if runtime.GOOS == "android" {
+		return
+	}
+	if groDev, ok := dev.(tun.GRODevice); ok {
 		if envknob.Bool("TS_TUN_DISABLE_UDP_GRO") ||
 			(knobs != nil && knobs.DisableTUNUDPGRO.Load()) {
 			groDev.DisableUDPGRO()
@@ -41,7 +62,7 @@ func (t *Wrapper) SetLinkFeaturesPostUp(knobs *controlknobs.Knobs) {
 		if errors.Is(err, unix.EINVAL) {
 			groDev.DisableTCPGRO()
 			groDev.DisableUDPGRO()
-			t.logf("disabled TUN TCP & UDP GRO due to GRO probe error: %v", err)
+			logf("disabled TUN TCP & UDP GRO due to GRO probe error: %v", err)
 		}
 	}
 }

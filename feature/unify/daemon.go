@@ -39,6 +39,10 @@ type hostDeps struct {
 	// newDNS creates the OS DNS configurator for the interface devName.
 	newDNS func(logf logger.Logf, sys *tsd.System, devName string) (dns.OSConfigurator, error)
 
+	// linkUp configures link features of dev (the GRO knobs and probe),
+	// once its router is up. It may be nil.
+	linkUp func(dev tun.Device, logf logger.Logf)
+
 	// listen listens on a LocalAPI socket.
 	listen func(path string) (net.Listener, error)
 }
@@ -109,7 +113,11 @@ func runDaemon(ctx context.Context, a tailscaledhooks.UnifyArgs, host hostDeps) 
 		r.Close()
 		return fmt.Errorf("unify: creating the OS DNS configurator: %w", err)
 	}
-	u, err := New(daemonOptions(a, cfg.Tailnets, st, dev, r, d)) // closes dev, r and d on error
+	opts := daemonOptions(a, cfg.Tailnets, st, dev, r, d)
+	if host.linkUp != nil {
+		opts.HostLinkUp = func(dev tun.Device) { host.linkUp(dev, logf) }
+	}
+	u, err := New(opts) // closes dev, r and d on error
 	if err != nil {
 		return err
 	}

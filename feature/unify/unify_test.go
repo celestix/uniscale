@@ -849,6 +849,15 @@ func TestStartErrors(t *testing.T) {
 			t.Error("backend started after the router failed")
 		}
 	})
+	t.Run("link up hook skipped when the router fails", func(t *testing.T) {
+		h := mustHarness(t, func(h *harness) {
+			h.opts.HostLinkUp = func(tun.Device) { t.Error("HostLinkUp called") }
+		})
+		h.router.upErr = errors.New("no tun")
+		if err := h.u.Start(); err == nil {
+			t.Fatal("Start succeeded")
+		}
+	})
 	t.Run("backend start fails", func(t *testing.T) {
 		h := mustHarness(t, nil)
 		h.stack("b").startErr = errors.New("bad prefs")
@@ -1247,5 +1256,30 @@ func TestRemapSaveErrors(t *testing.T) {
 	h.waitFor("expire save error", func() bool { return h.logs.count("unify: remap: saving state") == 1 })
 	if n := len(h.u.table.Mappings()); n != 0 {
 		t.Errorf("%d mappings left in memory", n)
+	}
+}
+
+// TestStartHostLinkUp checks that Start calls Options.HostLinkUp once, with
+// the host TUN, after the host router is up and before any stack starts.
+func TestStartHostLinkUp(t *testing.T) {
+	var calls []string
+	var h *harness
+	h = mustHarness(t, func(h2 *harness) {
+		h = h2
+		h2.opts.HostLinkUp = func(dev tun.Device) {
+			if d, ok := dev.(eventTUN); !ok || d.Device != h2.host {
+				t.Errorf("HostLinkUp(%v), want the host TUN", dev)
+			}
+			h2.router.mu.Lock()
+			ups := h2.router.ups
+			h2.router.mu.Unlock()
+			calls = append(calls, fmt.Sprintf("linkUp ups=%d starts=%d", ups, h2.stack(PrimaryName).starts))
+		}
+	})
+	if err := h.u.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"linkUp ups=1 starts=0"}; !slices.Equal(calls, want) {
+		t.Errorf("calls = %q, want %q", calls, want)
 	}
 }
