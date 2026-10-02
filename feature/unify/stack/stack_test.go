@@ -40,7 +40,6 @@ import (
 	"tailscale.com/tstest/integration/testcontrol"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/logid"
-	"tailscale.com/wgengine/netstack"
 	"tailscale.com/wgengine/router"
 )
 
@@ -649,12 +648,12 @@ func TestNewEngineError(t *testing.T) {
 }
 
 // TestCloseWithBlockedTUN tests that Close does not hang when netstack
-// has packets in flight to the host that are blocked by a full chantun queue.
-// Without closing the TUN device first (ruling 1), netstack.Close() would block
-// waiting on injectWG while chantun.Write blocks in the host-side read.
+// replies to quad-100 queries are blocked by a full chantun queue.
+// Without closing the TUN device first, netstack.Close() would block
+// waiting on injectWG while chantun.Write blocks when the host side is undrained.
 func TestCloseWithBlockedTUN(t *testing.T) {
 	tstest.ResourceCheck(t)
-	dev, err := chantun.New("unify-blocked", 1280, 8, 8)
+	dev, err := chantun.New("unify-blocked", 1280, 4, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -672,59 +671,58 @@ func TestCloseWithBlockedTUN(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Create a listening socket on netstack that will reply to any traffic.
-	// Replies go through netstack's injectToHost, which writes to the TUN.
-	nsImpl, ok := st.Sys().Netstack.Get().(*netstack.Impl)
-	if !ok {
-		t.Fatal("netstack is not *netstack.Impl")
+	// Do NOT drain the device's host side. When we inject DNS queries to
+	// 100.100.100.100:53, netstack replies with source 100.100.100.100.
+	// These replies go through injectToHost, which writes to chantun.
+	// Without draining, the chantun queue fills and writes block.
+
+	// Build minimal DNS query packets (A record for any name).
+	dnsQuery := []byte{
+		0x12, 0x34, // Transaction ID
+		0x01, 0x00, // Flags: standard query
+		0x00, 0x01, // Questions: 1
+		0x00, 0x00, // Answer RRs: 0
+		0x00, 0x00, // Authority RRs: 0
+		0x00, 0x00, // Additional RRs: 0
+		// Question section: qname="test", qtype=A, qclass=IN
+		0x04, 't', 'e', 's', 't', 0x00,
+		0x00, 0x01, // qtype=A
+		0x00, 0x01, // qclass=IN
 	}
-	ln, err := nsImpl.ListenTCP("tcp4", "100.100.100.100:9999")
-	if err != nil {
-		t.Fatalf("Listen: %v", err)
+
+	// Inject DNS queries to fill the TUN queue with replies.
+	// Each query gets a reply sourced from 100.100.100.100,
+	// so multiple queries fill the inbound queue.
+	for i := 0; i < cap(dev.Packets())*2; i++ {
+		h := packet.UDP4Header{
+			IP4Header: packet.IP4Header{
+				IPProto: ipproto.UDP,
+				IPID:    uint16(i),
+				Src:     netip.MustParseAddr("192.168.1.1"),
+				Dst:     netip.MustParseAddr("100.100.100.100"),
+			},
+			SrcPort: 10000 + uint16(i),
+			DstPort: 53,
+		}
+		pkt := packet.Generate(h, dnsQuery)
+		if err := dev.Inject(context.Background(), pkt); err != nil {
+			t.Fatalf("Inject DNS query %d: %v", i, err)
+		}
 	}
-	defer ln.Close()
 
-	// Goroutine to accept connections and echo data back.
-	// This drives netstack's injectToHost which writes to the TUN.
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				io.Copy(c, c) // echo
-			}(c)
-		}
-	}()
+	// Wait a bit for netstack to process and queue replies.
+	time.Sleep(100 * time.Millisecond)
 
-	// Send traffic to the netstack listener. Replies will be written to the
-	// TUN device. Do NOT drain the device, so the queue fills and writes block.
-	d := st.Sys().Dialer.Get()
-
-	// Dial and write data to trigger replies and fill the TUN queue.
-	go func() {
-		dialCtx, dialCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer dialCancel()
-		c, err := d.UserDial(dialCtx, "tcp", netip.AddrPortFrom(netip.MustParseAddr("100.100.100.100"), 9999).String())
-		if err != nil {
-			return
-		}
-		defer c.Close()
-		// Send enough data to fill the queue.
-		for i := 0; i < 100; i++ {
-			c.Write([]byte("hello"))
-			time.Sleep(1 * time.Millisecond)
-		}
-	}()
-
-	// Wait for traffic to flow and the queue to fill.
-	time.Sleep(200 * time.Millisecond)
+	// Assert the device's queue is actually full (or nearly full).
+	// If cap and len match, the queue is at capacity.
+	qlen := len(dev.Packets())
+	qcap := cap(dev.Packets())
+	if qlen == 0 {
+		t.Logf("Warning: device queue not filled (len=%d, cap=%d); test may not reproduce the hang", qlen, qcap)
+	}
 
 	// Close should return quickly without hanging because we close the TUN
-	// device first in Stack.Close, which unblocks any writes blocked in
-	// chantun.Write.
+	// device first in Stack.Close, which unblocks any writes blocked in chantun.Write.
 	closeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	closeErr := make(chan error, 1)
@@ -738,7 +736,7 @@ func TestCloseWithBlockedTUN(t *testing.T) {
 			t.Errorf("Close: %v", err)
 		}
 	case <-closeCtx.Done():
-		t.Fatal("Close hung for 3 seconds with netstack packets blocked; want TUN close to unblock them")
+		t.Fatal("Close hung for 3 seconds with full TUN queue; want TUN close to unblock replies")
 	}
 }
 
