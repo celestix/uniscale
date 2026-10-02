@@ -442,3 +442,42 @@ func TestExitICMPErrorQuotesInternetOnly(t *testing.T) {
 			b: icmpErr("fd7a:115c:a1e0::1", "2606:4700:4700::1111", pkt(ipproto.UDP, "[fd12::1]:53", "[fd7a:115c:a1e0::1]:4000")), verdict: Drop},
 	})
 }
+
+// Review focus (C1): the quoted destination of an outbound ICMP error
+// enters the stack like a source address would: this node's virtual self
+// becomes its real self, a host inside a subnet advertised to the tailnet
+// (or the internet, when this node offers the tailnet an exit) is kept, and
+// anything else, including any unified-space address, drops the error. A
+// virtual address of another tailnet must never reach a stack.
+func TestOutboundICMPErrorQuotedDestination(t *testing.T) {
+	tr := scenario(t)
+	stacks := scenarioStacks()
+	stacks[1].Advertised = []netip.Prefix{mpp("192.168.50.0/24")} // personal too
+	if err := tr.SetStacks(stacks); err != nil {
+		t.Fatal(err)
+	}
+	runICMPErrors(t, tr, []icmpErrCase{
+		{name: "the tailnet's virtual self, from a LAN router",
+			b:       icmpErr("192.168.50.1", "100.70.2.10", pkt(ipproto.UDP, "100.70.2.10:5000", "198.18.0.0:53")),
+			verdict: ToStack, wantOwner: "personal",
+			wantSrc: "192.168.50.1", wantDst: "100.70.2.10", wantQSrc: "100.70.2.10", wantQDst: "100.70.2.9"},
+		{name: "inside the advertised subnet, from a LAN router",
+			b:       icmpErr("192.168.50.1", "100.88.1.4", pkt(ipproto.TCP, "100.88.1.4:4000", "192.168.50.9:22")),
+			verdict: ToStack, wantOwner: "work",
+			wantSrc: "192.168.50.1", wantDst: "100.88.1.4", wantQSrc: "100.88.1.4", wantQDst: "192.168.50.9"},
+		{name: "another tailnet's virtual self",
+			b: icmpErr("100.99.0.1", "198.18.0.1", pkt(ipproto.UDP, "198.18.0.1:5000", "198.18.0.0:53")), verdict: Drop},
+		{name: "another tailnet's identity self",
+			b: icmpErr("100.99.0.1", "198.18.0.1", pkt(ipproto.UDP, "198.18.0.1:5000", "100.101.5.2:53")), verdict: Drop},
+		{name: "another tailnet's remapped subnet",
+			b: icmpErr("203.0.113.1", "198.18.0.1", pkt(ipproto.TCP, "198.18.0.1:4000", "198.19.3.4:443")), verdict: Drop},
+		{name: "a peer of the same tailnet",
+			b: icmpErr("192.168.50.1", "100.88.1.4", pkt(ipproto.UDP, "100.88.1.4:5000", "100.70.2.9:53")), verdict: Drop},
+		{name: "outside the advertised subnet",
+			b: icmpErr("192.168.50.1", "100.88.1.4", pkt(ipproto.TCP, "100.88.1.4:4000", "192.168.60.9:22")), verdict: Drop},
+		{name: "reserved, for the tailnet we offer an exit to",
+			b: icmpErr("203.0.113.1", "198.18.0.1", pkt(ipproto.TCP, "198.18.0.1:4000", "100.100.1.1:443")), verdict: Drop},
+		{name: "ipv6 another tailnet's self",
+			b: icmpErr("fd7a:115c:a1e0::77", "fd00:1::", pkt(ipproto.UDP, "[fd00:1::]:5000", "[fd7a:115c:a1e0::52]:53")), verdict: Drop},
+	})
+}

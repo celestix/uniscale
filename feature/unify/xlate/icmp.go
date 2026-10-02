@@ -133,13 +133,16 @@ func (t *Translator) inboundQuote(ss *stackSet, owner remap.Owner, q *packet.Par
 }
 
 // outboundQuote decides the quoted addresses of an ICMP error the host
-// sends to stack st, with outer source src (newSrc once translated). The
-// quoted packet came from st's tailnet, so its source must translate
-// within that tailnet. Its destination becomes newSrc when it is src and
-// is otherwise kept, as for errors from routers on paths this node
-// forwards. It returns a non-zero drop reason if the error must be
-// dropped.
-func (t *Translator) outboundQuote(ss *stackSet, st Stack, q *packet.Parsed, src, newSrc netip.Addr) (quoteEdit, DropReason) {
+// sends to stack st. The quoted packet came from st's tailnet, so its
+// source must translate within that tailnet. Its destination, an address
+// on this side, enters st under the rules for outer sources
+// ([Translator.outboundSrc]): st's virtual self becomes its real self, a
+// host inside a subnet advertised to st, or on the internet when this node
+// offers st an exit, is kept (errors from routers on paths this node
+// forwards), and anything else is refused, so no other unified-space
+// address reaches st. It returns a non-zero drop reason if the error must
+// be dropped.
+func (t *Translator) outboundQuote(ss *stackSet, st Stack, q *packet.Parsed) (quoteEdit, DropReason) {
 	qt, ok := parseQuote(q)
 	if !ok {
 		return quoteEdit{}, DropMalformedICMPError
@@ -148,9 +151,9 @@ func (t *Translator) outboundQuote(ss *stackSet, st Stack, q *packet.Parsed, src
 	if !ok {
 		return quoteEdit{}, DropICMPErrorOutsideTailnet
 	}
-	qdst := qt.dst
-	if qdst == src {
-		qdst = newSrc
+	qdst, ok := t.outboundSrc(st, qt.dst)
+	if !ok {
+		return quoteEdit{}, DropICMPErrorOutsideTailnet
 	}
 	return quoteEdit{q: qt, src: qsrc, dst: qdst}, 0
 }
@@ -161,8 +164,12 @@ func (t *Translator) outboundQuote(ss *stackSet, st Stack, q *packet.Parsed, src
 // internet address and st is the stack using an exit node (as for the
 // replies [Translator.Inbound] accepts from it), or under the source rules
 // for traffic this node forwards for st (advertised subnets, exit node
-// offered), and is never a reserved address.
+// offered), and is never a reserved address. Quad-100 is kept for the
+// stack serving it.
 func (t *Translator) outboundQuotedSrc(ss *stackSet, st Stack, s netip.Addr) (netip.Addr, bool) {
+	if isQuad100(s) {
+		return s, st.Owner == ss.quad100
+	}
 	if owner, r, ok := t.m.VirtualToReal(s); ok {
 		if owner != st.Owner {
 			return netip.Addr{}, false

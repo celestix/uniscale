@@ -31,6 +31,7 @@ var reserved = []netip.Prefix{
 //	          peers 100.70.2.9, 100.88.1.4, fd7a:115c:a1e0::99
 //	          routed subnets 10.10.0.0/16, 172.20.0.0/16 (identity, only
 //	          work routes it); advertises our LAN 192.168.50.0/24
+//	          serves quad-100 for the host (the primary tailnet)
 //	personal: self 100.70.2.9        -> 198.18.0.0 (collides with work peer)
 //	          peer 100.70.2.10       (identity)
 //	          routed subnet 10.10.0.0/16 -> 198.19.0.0/16
@@ -63,14 +64,19 @@ func scenario(t *testing.T) *Translator {
 	sync("friends", p("100.99.0.1/32", "fd7a:115c:a1e0::77/128"), p("100.88.1.4/32", "fd7a:115c:a1e0::99/128"), nil)
 
 	tr := New(tb, reserved)
-	if err := tr.SetStacks([]Stack{
-		{Owner: "work", Self: []netip.Addr{mpa("100.101.5.2"), mpa("fd7a:115c:a1e0::52")}, Advertised: p("192.168.50.0/24")},
-		{Owner: "personal", Self: []netip.Addr{mpa("100.70.2.9")}, UsesExit: true},
-		{Owner: "friends", Self: []netip.Addr{mpa("100.99.0.1"), mpa("fd7a:115c:a1e0::77")}, OffersExit: true},
-	}); err != nil {
+	if err := tr.SetStacks(scenarioStacks()); err != nil {
 		t.Fatal(err)
 	}
 	return tr
+}
+
+// scenarioStacks returns the stacks of [scenario].
+func scenarioStacks() []Stack {
+	return []Stack{
+		{Owner: "work", Self: []netip.Addr{mpa("100.101.5.2"), mpa("fd7a:115c:a1e0::52")}, Advertised: []netip.Prefix{mpp("192.168.50.0/24")}, Quad100: true},
+		{Owner: "personal", Self: []netip.Addr{mpa("100.70.2.9")}, UsesExit: true},
+		{Owner: "friends", Self: []netip.Addr{mpa("100.99.0.1"), mpa("fd7a:115c:a1e0::77")}, OffersExit: true},
+	}
 }
 
 type flow struct {
@@ -538,6 +544,7 @@ func TestSetStacksErrors(t *testing.T) {
 		"empty owner": {{}},
 		"duplicate":   {{Owner: "a"}, {Owner: "a"}},
 		"two exits":   {{Owner: "a", UsesExit: true}, {Owner: "b", UsesExit: true}},
+		"two quad100": {{Owner: "a", Quad100: true}, {Owner: "b", Quad100: true}},
 	} {
 		if err := tr.SetStacks(stacks); err == nil {
 			t.Errorf("%s: want error", name)

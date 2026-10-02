@@ -23,6 +23,7 @@ import (
 	"tailscale.com/feature/unify/remap"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/packet/checksum"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/types/ipproto"
 )
 
@@ -43,6 +44,10 @@ type Stack struct {
 	OffersExit bool
 	// UsesExit reports whether this node uses an exit node of the tailnet.
 	UsesExit bool
+	// Quad100 reports whether the stack serves Tailscale's service address
+	// (100.100.100.100, fd7a:115c:a1e0::53) to the host. Unify gives it to
+	// the primary tailnet.
+	Quad100 bool
 }
 
 // Verdict says what to do with a translated packet.
@@ -116,6 +121,7 @@ func drop(r DropReason) Result { return Result{Verdict: Drop, Reason: r} }
 type stackSet struct {
 	byOwner map[remap.Owner]Stack
 	exit    remap.Owner // stack using an exit node, or ""
+	quad100 remap.Owner // stack serving quad-100, or ""
 }
 
 // Translator translates packets. It is safe for concurrent use.
@@ -135,7 +141,8 @@ func New(m Mapper, reserved []netip.Prefix) *Translator {
 }
 
 // SetStacks replaces the set of stacks. At most one stack may use an exit
-// node, and owners must be unique and non-empty.
+// node, at most one may serve quad-100, and owners must be unique and
+// non-empty.
 func (t *Translator) SetStacks(stacks []Stack) error {
 	ss := &stackSet{byOwner: make(map[remap.Owner]Stack, len(stacks))}
 	for _, st := range stacks {
@@ -150,6 +157,12 @@ func (t *Translator) SetStacks(stacks []Stack) error {
 				return fmt.Errorf("xlate: tailnets %q and %q both use an exit node", ss.exit, st.Owner)
 			}
 			ss.exit = st.Owner
+		}
+		if st.Quad100 {
+			if ss.quad100 != "" {
+				return fmt.Errorf("xlate: tailnets %q and %q both serve quad-100", ss.quad100, st.Owner)
+			}
+			ss.quad100 = st.Owner
 		}
 		st.Self = slices.Clone(st.Self)
 		st.Advertised = slices.Clone(st.Advertised)
@@ -170,25 +183,28 @@ func (t *Translator) Outbound(q *packet.Parsed) Result {
 	}
 	ss := t.stacks.Load()
 	src, dst := q.Src.Addr(), q.Dst.Addr()
-	owner, realDst, ok := t.m.VirtualToReal(dst)
+	owner, realDst, ok := t.outboundDst(ss, dst)
 	if !ok {
-		if ss.exit == "" || t.isReserved(dst) {
-			return drop(DropNoRoute)
-		}
-		owner, realDst = ss.exit, dst
+		return drop(DropNoRoute)
 	}
 	st, ok := ss.byOwner[owner]
 	if !ok {
 		return drop(DropUnknownTailnet)
 	}
-	newSrc, ok := t.outboundSrc(st, src)
+	var newSrc netip.Addr
+	if isQuad100(dst) {
+		// The service answers this node only.
+		newSrc, ok = t.realSelf(st, src)
+	} else {
+		newSrc, ok = t.outboundSrc(st, src)
+	}
 	if !ok {
 		return drop(DropSourceNotAllowed)
 	}
 	p := plan{src: newSrc, dst: realDst}
 	if q.IsError() {
 		var reason DropReason
-		if p.quote, reason = t.outboundQuote(ss, st, q, src, newSrc); reason != 0 {
+		if p.quote, reason = t.outboundQuote(ss, st, q); reason != 0 {
 			return drop(reason)
 		}
 	}
@@ -198,12 +214,39 @@ func (t *Translator) Outbound(q *packet.Parsed) Result {
 	return Result{Verdict: ToStack, Owner: owner}
 }
 
-// outboundSrc returns the real source for a packet from the host to st.
-func (t *Translator) outboundSrc(st Stack, src netip.Addr) (netip.Addr, bool) {
+// outboundDst returns the stack a packet from the host to dst goes to, and
+// dst in that stack's real space: the owner of dst's mapping, or the stack
+// using an exit node for any other address that is not reserved. Quad-100
+// is never a peer's address: it goes to the stack serving it, if any,
+// whatever mapping covers it.
+func (t *Translator) outboundDst(ss *stackSet, dst netip.Addr) (remap.Owner, netip.Addr, bool) {
+	if isQuad100(dst) {
+		return ss.quad100, dst, ss.quad100 != ""
+	}
+	if owner, realDst, ok := t.m.VirtualToReal(dst); ok {
+		return owner, realDst, true
+	}
+	if ss.exit == "" || t.isReserved(dst) {
+		return "", netip.Addr{}, false
+	}
+	return ss.exit, dst, true
+}
+
+// realSelf returns st's real self address whose unified-space address is
+// v.
+func (t *Translator) realSelf(st Stack, v netip.Addr) (netip.Addr, bool) {
 	for _, self := range st.Self {
-		if v, ok := t.m.RealToVirtual(st.Owner, self); ok && v == src {
+		if sv, ok := t.m.RealToVirtual(st.Owner, self); ok && sv == v {
 			return self, true
 		}
+	}
+	return netip.Addr{}, false
+}
+
+// outboundSrc returns the real source for a packet from the host to st.
+func (t *Translator) outboundSrc(st Stack, src netip.Addr) (netip.Addr, bool) {
+	if self, ok := t.realSelf(st, src); ok {
+		return self, true
 	}
 	if _, _, ok := t.m.VirtualToReal(src); ok {
 		// A virtual address other than this stack's own self address: a
@@ -237,7 +280,8 @@ func (t *Translator) Inbound(owner remap.Owner, q *packet.Parsed) Result {
 		return drop(DropUnmappedSource)
 	}
 	vdst, ok := t.inboundDst(st, dst)
-	if !ok {
+	if !ok || (isQuad100(src) && !slices.Contains(st.Self, dst)) {
+		// Quad-100 answers this node only.
 		return drop(DropDestinationNotReachable)
 	}
 	p := plan{src: vsrc, dst: vdst}
@@ -258,8 +302,12 @@ func (t *Translator) Inbound(owner remap.Owner, q *packet.Parsed) Result {
 // exit node may also carry internet addresses (replies from the exit), which
 // are kept unchanged; reserved, unified-space and non-internet addresses
 // never are, so the exit cannot impersonate a peer of any tailnet or a host
-// on this host's networks.
+// on this host's networks. Quad-100 is kept, from the stack serving it
+// only: no other stack may pose as it, whatever its mappings.
 func (t *Translator) inboundAddr(ss *stackSet, owner remap.Owner, a netip.Addr) (netip.Addr, bool) {
+	if isQuad100(a) {
+		return a, owner == ss.quad100
+	}
 	if v, ok := t.m.RealToVirtual(owner, a); ok {
 		return v, true
 	}
@@ -315,6 +363,14 @@ func wellFormed(q *packet.Parsed) bool {
 }
 
 func (t *Translator) isReserved(a netip.Addr) bool { return containsAddr(t.reserved, a) }
+
+var (
+	quad100v4 = tsaddr.TailscaleServiceIP()
+	quad100v6 = tsaddr.TailscaleServiceIPv6()
+)
+
+// isQuad100 reports whether a is Tailscale's service address.
+func isQuad100(a netip.Addr) bool { return a == quad100v4 || a == quad100v6 }
 
 // isInternet reports whether a may be carried unchanged through an exit
 // node this host uses: a global unicast address that is neither private
