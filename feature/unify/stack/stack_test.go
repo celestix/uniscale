@@ -671,12 +671,12 @@ func TestCloseWithBlockedTUN(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Do NOT drain the device's host side. When we inject DNS queries to
-	// 100.100.100.100:53, netstack replies with source 100.100.100.100.
-	// These replies go through injectToHost, which writes to chantun.
-	// Without draining, the chantun queue fills and writes block.
+	// Do NOT drain the device's host side. Queries sent to 100.100.100.100:53
+	// are answered by netstack with replies sourced from 100.100.100.100;
+	// those replies are injected to the host through chantun.Write, which
+	// blocks once the outbound queue (dev.Packets()) is full.
 
-	// Build minimal DNS query packets (A record for any name).
+	// Minimal DNS query packet (A record for "test").
 	dnsQuery := []byte{
 		0x12, 0x34, // Transaction ID
 		0x01, 0x00, // Flags: standard query
@@ -684,16 +684,15 @@ func TestCloseWithBlockedTUN(t *testing.T) {
 		0x00, 0x00, // Answer RRs: 0
 		0x00, 0x00, // Authority RRs: 0
 		0x00, 0x00, // Additional RRs: 0
-		// Question section: qname="test", qtype=A, qclass=IN
-		0x04, 't', 'e', 's', 't', 0x00,
+		0x04, 't', 'e', 's', 't', 0x00, // qname
 		0x00, 0x01, // qtype=A
 		0x00, 0x01, // qclass=IN
 	}
 
-	// Inject DNS queries to fill the TUN queue with replies.
-	// Each query gets a reply sourced from 100.100.100.100,
-	// so multiple queries fill the inbound queue.
-	for i := 0; i < cap(dev.Packets())*2; i++ {
+	// Inject several times more queries than the queue depth, so once the
+	// queue is full at least one more reply is pending in a blocked Write.
+	q := dev.Packets()
+	for i := 0; i < cap(q)*4; i++ {
 		h := packet.UDP4Header{
 			IP4Header: packet.IP4Header{
 				IPProto: ipproto.UDP,
@@ -710,16 +709,16 @@ func TestCloseWithBlockedTUN(t *testing.T) {
 		}
 	}
 
-	// Wait a bit for netstack to process and queue replies.
-	time.Sleep(100 * time.Millisecond)
-
-	// Assert the device's queue is actually full (or nearly full).
-	// If cap and len match, the queue is at capacity.
-	qlen := len(dev.Packets())
-	qcap := cap(dev.Packets())
-	if qlen == 0 {
-		t.Logf("Warning: device queue not filled (len=%d, cap=%d); test may not reproduce the hang", qlen, qcap)
+	// Wait until the outbound queue is full; fail if it never gets there.
+	deadline := time.Now().Add(3 * time.Second)
+	for len(q) != cap(q) {
+		if time.Now().After(deadline) {
+			t.Fatalf("TUN outbound queue never filled: len=%d cap=%d", len(q), cap(q))
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
+	// Give the extra replies a moment to reach the blocked Write.
+	time.Sleep(50 * time.Millisecond)
 
 	// Close should return quickly without hanging because we close the TUN
 	// device first in Stack.Close, which unblocks any writes blocked in chantun.Write.
