@@ -2544,13 +2544,9 @@ func TestSetRouteSourcesIgnored(t *testing.T) {
 	if d := cmp.Diff(want, got); d != "" {
 		t.Errorf("replace commands (-want +got):\n%s", d)
 	}
-	for _, w := range []string{
-		"route 100.64.0.1/32: ignoring source fd7a:115c:a1e0::2",
-		"route 100.64.0.3/32: ignoring source 100.64.0.9",
-	} {
-		if !strings.Contains(logs.String(), w) {
-			t.Errorf("no log %q in:\n%s", w, logs.String())
-		}
+	wantLog := "ignoring the sources of 2 routes (first: route 100.64.0.1/32, source fd7a:115c:a1e0::2)"
+	if !strings.Contains(logs.String(), wantLog) {
+		t.Errorf("no log %q in:\n%s", wantLog, logs.String())
 	}
 	if strings.Contains(logs.String(), "100.64.0.4/32") {
 		t.Errorf("zero source logged:\n%s", logs.String())
@@ -2825,6 +2821,87 @@ func TestSetRouteSourceTentative(t *testing.T) {
 			}
 			if got, want := lr.routeSrc[route].IsValid(), !tt.wantErr; got != want {
 				t.Errorf("source tracked = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+// TestSetRouteSourceTentativeBudget checks that the IPv6 tentative-source
+// retry budget is shared per source within a Set, not per route.
+func TestSetRouteSourceTentativeBudget(t *testing.T) {
+	tstest.Replace(t, &srcRetryDelay, time.Microsecond)
+	tests := []struct {
+		name      string
+		sources   []string
+		routes    []string
+		wantTries int
+		wantErr   bool
+	}{
+		{
+			name:      "one source, three routes",
+			sources:   []string{"fd7a:115c:a1e0::2"},
+			routes:    []string{"fd7a:115c:a1e0::3/128", "fd7a:115c:a1e0::4/128", "fd7a:115c:a1e0::5/128"},
+			wantTries: srcRetries + 3, // srcRetries for the source + 1 per route = 50 + 3
+			wantErr:   true,
+		},
+		{
+			name:      "two sources, two routes each",
+			sources:   []string{"fd7a:115c:a1e0::2", "fd7a:115c:a1e0::12"},
+			routes:    []string{"fd7a:115c:a1e0::3/128", "fd7a:115c:a1e0::4/128", "fd7a:115c:a1e0::13/128", "fd7a:115c:a1e0::14/128"},
+			wantTries: 2*(srcRetries+1) + 2, // 2 sources: (srcRetries+1) each + 2 routes = 102 + 2
+			wantErr:   true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lr, fake := newTestLinuxRouter(t)
+
+			// Parse sources and routes
+			srcAddrs := make([]netip.Addr, len(tt.sources))
+			for i, s := range tt.sources {
+				srcAddrs[i] = netip.MustParseAddr(s)
+			}
+
+			routePrefixes := mustCIDRs(tt.routes...)
+			tsaddr.SortPrefixes(routePrefixes)
+
+			// Build RouteSources map: assign sources to routes based on name prefix
+			routeSources := make(map[netip.Prefix]netip.Addr)
+			for _, route := range routePrefixes {
+				routeIP := route.Addr().String()
+				// Assign sources based on whether route IP contains ::3/::4 (src 0) or ::13/::14 (src 1)
+				if len(srcAddrs) == 1 {
+					routeSources[route] = srcAddrs[0]
+				} else if strings.Contains(routeIP, "::13") || strings.Contains(routeIP, "::14") {
+					routeSources[route] = srcAddrs[1]
+				} else {
+					routeSources[route] = srcAddrs[0]
+				}
+			}
+
+			runner := &refusingRunner{fakeOS: fake, refusals: 1000}
+			lr.cmd = runner
+
+			localAddrs := make([]netip.Prefix, len(srcAddrs))
+			for i, addr := range srcAddrs {
+				localAddrs[i] = netip.PrefixFrom(addr, 128)
+			}
+
+			err := lr.Set(&Config{
+				LocalAddrs:    localAddrs,
+				Routes:        routePrefixes,
+				RouteSources:  routeSources,
+				NetfilterMode: netfilterOff,
+			})
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Set error = %v, want error %v", err, tt.wantErr)
+			}
+			if runner.tries != tt.wantTries {
+				t.Errorf("%d replace commands, want %d", runner.tries, tt.wantTries)
+			}
+			if len(lr.routeSrc) != 0 {
+				t.Errorf("tracked %v, want empty", lr.routeSrc)
 			}
 		})
 	}

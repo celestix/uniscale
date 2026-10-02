@@ -1226,8 +1226,12 @@ func (r *linuxRouter) addRoute(cidr netip.Prefix) error {
 // source. A source that is not the address of an applied cfg.LocalAddrs
 // entry, or not of the route's family, is ignored: the route gets none.
 //
-// It runs no commands when no route has or wants a source. A route whose
-// source fails to apply keeps its tracked source, so the next Set retries.
+// It runs no commands when no route has or wants a source. Within one Set,
+// a v6 source that exhausts its retry budget is tried only once for the
+// remaining routes that use it, so a slow-to-become-usable source does not
+// serialize the entire Set. A route whose source fails to apply keeps its
+// tracked source, and the next Set retries only if the desired source differs
+// from the tracked one.
 // [linuxRouter.mu] must be held.
 func (r *linuxRouter) setRouteSourcesLocked(cfg *router.Config) error {
 	if len(cfg.RouteSources) == 0 && len(r.routeSrc) == 0 {
@@ -1247,17 +1251,36 @@ func (r *linuxRouter) setRouteSourcesLocked(cfg *router.Config) error {
 	}
 	tsaddr.SortPrefixes(todo)
 
+	var exhausted set.Set[netip.Addr] // v6 sources that ran out of retries in this Set
 	var fails []error
+	var ignoredCount int
+	var firstIgnoredRoute netip.Prefix
+	var firstIgnoredSrc netip.Addr
+
 	for _, p := range todo {
 		src := cfg.RouteSources[p]
 		if src.IsValid() && (src.Is4() != p.Addr().Is4() || !local.Contains(src)) {
-			r.logf("route %v: ignoring source %v: not an applied local address of the route's family", p, src)
+			if ignoredCount == 0 {
+				firstIgnoredRoute = p
+				firstIgnoredSrc = src
+			}
+			ignoredCount++
 			src = netip.Addr{}
 		}
 		if src == r.routeSrc[p] {
 			continue
 		}
-		if err := r.setRouteSource(p, src); err != nil {
+		retries := srcRetries
+		if exhausted.Contains(src) {
+			retries = 0
+		}
+		if err := r.setRouteSource(p, src, retries); err != nil {
+			if src.Is6() && errors.Is(err, errEINVAL) {
+				if exhausted == nil {
+					exhausted = make(set.Set[netip.Addr])
+				}
+				exhausted.Add(src)
+			}
 			r.logf("route %v: setting source %v failed: %v", p, src, err)
 			fails = append(fails, err)
 			continue
@@ -1267,6 +1290,9 @@ func (r *linuxRouter) setRouteSourcesLocked(cfg *router.Config) error {
 		} else {
 			delete(r.routeSrc, p)
 		}
+	}
+	if ignoredCount > 0 {
+		r.logf("ignoring the sources of %d routes (first: route %v, source %v): not an applied local address of the route's family", ignoredCount, firstIgnoredRoute, firstIgnoredSrc)
 	}
 	if len(fails) == 1 {
 		return fails[0]
@@ -1286,8 +1312,11 @@ var (
 
 // setRouteSource replaces the route for cidr, as [linuxRouter.addRoute]
 // adds it, with one whose preferred source is src, or that has none if src
-// is the zero Addr. The kernel creates the route if it is missing.
-func (r *linuxRouter) setRouteSource(cidr netip.Prefix, src netip.Addr) error {
+// is the zero Addr. The kernel creates the route if it is missing. retries
+// bounds how many times to retry for a tentative IPv6 source; if it reaches
+// zero before the route succeeds, a caller such as setRouteSourcesLocked may
+// reuse the same source for subsequent routes, spending zero retries.
+func (r *linuxRouter) setRouteSource(cidr netip.Prefix, src netip.Addr, retries int) error {
 	if !r.getV6Available() && cidr.Addr().Is6() {
 		return nil
 	}
@@ -1296,7 +1325,7 @@ func (r *linuxRouter) setRouteSource(cidr netip.Prefix, src netip.Addr) error {
 	// tentative, which a new address is for a moment even on a TUN, where
 	// duplicate address detection is skipped: the flag is cleared from a
 	// work queue after the address is added.
-	for i := 0; i < srcRetries && src.Is6() && errors.Is(err, errEINVAL); i++ {
+	for i := 0; i < retries && src.Is6() && errors.Is(err, errEINVAL); i++ {
 		time.Sleep(srcRetryDelay)
 		err = r.replaceRoute(cidr, src)
 	}
