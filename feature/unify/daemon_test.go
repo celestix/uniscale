@@ -38,6 +38,7 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/util/eventbus"
+	"tailscale.com/util/set"
 	"tailscale.com/wgengine/router"
 )
 
@@ -217,20 +218,40 @@ func (h *daemonHarness) status(ctx context.Context, name string) *ipnstate.Statu
 // close first, then the TUN, router and DNS configurator, in that order.
 func (h *daemonHarness) checkClosed(ordered bool) {
 	h.t.Helper()
-	var sockets, rest []string
+	var sockets []string
+	created := set.Set[string]{}
 	for _, c := range h.getCreated() {
 		if name, ok := strings.CutPrefix(c, "listen "); ok {
 			sockets = append(sockets, "close "+name)
 		} else {
-			rest = append(rest, strings.Fields(c)[0])
+			component := strings.Fields(c)[0]
+			created.Add(component)
 		}
 	}
 	got := h.events.get()
-	if want := append(slices.Clip(sockets), rest...); !slices.Equal(slices.Sorted(slices.Values(got)), slices.Sorted(slices.Values(want))) {
+	// Unify.Close closes in order: stacks, portClient, router, dns, loop/tun.
+	// Daemon stacks run under ipnserver, which closes them as part of shutting down.
+	// For host components, the order is: router, dns, tun (in that order).
+	closeOrder := []string{"router", "dns", "tun"}
+	var expectedHostOrder []string
+	for _, component := range closeOrder {
+		if created.Contains(component) {
+			expectedHostOrder = append(expectedHostOrder, component)
+		}
+	}
+	want := append(slices.Clip(sockets), expectedHostOrder...)
+	if !slices.Equal(slices.Sorted(slices.Values(got)), slices.Sorted(slices.Values(want))) {
 		h.t.Fatalf("closed %q, want each of %q once", got, want)
 	}
-	if ordered && (!slices.Equal(slices.Sorted(slices.Values(got[:len(sockets)])), slices.Sorted(slices.Values(sockets))) || !slices.Equal(got[len(sockets):], rest)) {
-		h.t.Fatalf("closed %q, want %q (any order) then %q", got, sockets, rest)
+	if ordered {
+		// Sockets should close first (any order among themselves).
+		if !slices.Equal(slices.Sorted(slices.Values(got[:len(sockets)])), slices.Sorted(slices.Values(sockets))) {
+			h.t.Fatalf("closed %q, want sockets first %q (any order)", got, sockets)
+		}
+		// Host components should close in the explicit order.
+		if !slices.Equal(got[len(sockets):], expectedHostOrder) {
+			h.t.Fatalf("closed %q, want sockets %q (any order) then host components %q", got, sockets, expectedHostOrder)
+		}
 	}
 	for _, c := range sockets {
 		path := filepath.Join(filepath.Dir(h.args.SocketPath), strings.TrimPrefix(c, "close "))
@@ -375,7 +396,7 @@ func TestDaemon(t *testing.T) {
 	if err := h.wait(errc); err != nil {
 		t.Fatalf("runDaemon = %v", err)
 	}
-	h.checkClosed(false)
+	h.checkClosed(true)
 	if h.logs.count("unify: shutting down") != 1 {
 		t.Error("shutdown not logged")
 	}
@@ -398,7 +419,7 @@ func TestDaemonHostTUNFails(t *testing.T) {
 	if !errors.Is(err, os.ErrClosed) || !strings.Contains(err.Error(), "host TUN") {
 		t.Fatalf("runDaemon = %v, want the host TUN's failure", err)
 	}
-	h.checkClosed(false)
+	h.checkClosed(true)
 }
 
 // TestDaemonServerStops stops everything when one tailnet's LocalAPI
@@ -421,7 +442,7 @@ func TestDaemonServerStops(t *testing.T) {
 	if h.logs.count(`LocalAPI server of tailnet "b" stopped`) != 1 {
 		t.Error("stop not logged")
 	}
-	h.checkClosed(false)
+	h.checkClosed(true)
 }
 
 func TestDaemonErrors(t *testing.T) {
