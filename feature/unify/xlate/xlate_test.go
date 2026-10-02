@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"net/netip"
-	"strings"
 	"testing"
 	"time"
 
@@ -81,8 +80,8 @@ type flow struct {
 	src, dst         string // ip:port
 	verdict          Verdict
 	wantOwner        remap.Owner
-	wantSrc, wantDst string // addresses after translation
-	wantReason       string // substring, for drops
+	wantSrc, wantDst string     // addresses after translation
+	wantReason       DropReason // for drops
 }
 
 func runFlows(t *testing.T, inbound bool, flows []flow) {
@@ -102,8 +101,8 @@ func runFlows(t *testing.T, inbound bool, flows []flow) {
 				t.Fatalf("verdict = %v (%s), want %v", r.Verdict, r.Reason, f.verdict)
 			}
 			if f.verdict == Drop {
-				if !strings.Contains(r.Reason, f.wantReason) {
-					t.Fatalf("reason = %q, want it to contain %q", r.Reason, f.wantReason)
+				if r.Reason != f.wantReason {
+					t.Fatalf("reason = %q, want %q", r.Reason, f.wantReason)
 				}
 				if string(b) != orig {
 					t.Fatal("dropped packet was modified")
@@ -139,27 +138,27 @@ func TestOutbound(t *testing.T) {
 		{name: "friends remapped peer", proto: ipproto.UDP, src: "100.99.0.1:4000", dst: "198.18.0.1:53",
 			verdict: ToStack, wantOwner: "friends", wantSrc: "100.99.0.1", wantDst: "100.88.1.4"},
 		{name: "friends remapped ipv6 peer", proto: ipproto.ICMPv4, src: "[fd7a:115c:a1e0::52]:0", dst: "[fd00:1::]:0",
-			verdict: Drop, wantReason: "source not allowed"},
+			verdict: Drop, wantReason: DropSourceNotAllowed},
 		{name: "work ipv6 peer", proto: ipproto.TCP, src: "[fd7a:115c:a1e0::52]:4000", dst: "[fd7a:115c:a1e0::99]:22",
 			verdict: ToStack, wantOwner: "work", wantSrc: "fd7a:115c:a1e0::52", wantDst: "fd7a:115c:a1e0::99"},
 		{name: "wrong tailnet source", proto: ipproto.TCP, src: "100.101.5.2:4000", dst: "198.18.0.1:22",
-			verdict: Drop, wantReason: "source not allowed"},
+			verdict: Drop, wantReason: DropSourceNotAllowed},
 		{name: "peer virtual address as source", proto: ipproto.TCP, src: "100.88.1.4:4000", dst: "198.18.0.1:22",
-			verdict: Drop, wantReason: "source not allowed"},
+			verdict: Drop, wantReason: DropSourceNotAllowed},
 		{name: "internet via personal exit node", proto: ipproto.TCP, src: "198.18.0.0:4000", dst: "1.1.1.1:443",
 			verdict: ToStack, wantOwner: "personal", wantSrc: "100.70.2.9", wantDst: "1.1.1.1"},
 		{name: "internet with another tailnet's source", proto: ipproto.TCP, src: "100.101.5.2:4000", dst: "1.1.1.1:443",
-			verdict: Drop, wantReason: "source not allowed"},
+			verdict: Drop, wantReason: DropSourceNotAllowed},
 		{name: "unmapped tailscale address never goes to exit", proto: ipproto.TCP, src: "198.18.0.0:4000", dst: "100.100.1.1:443",
-			verdict: Drop, wantReason: "no route"},
+			verdict: Drop, wantReason: DropNoRoute},
 		{name: "unmapped pool address never goes to exit", proto: ipproto.TCP, src: "198.18.0.0:4000", dst: "198.18.9.9:443",
-			verdict: Drop, wantReason: "no route"},
+			verdict: Drop, wantReason: DropNoRoute},
 		{name: "reply from advertised LAN keeps source", proto: ipproto.TCP, src: "192.168.50.7:22", dst: "100.88.1.4:4000",
 			verdict: ToStack, wantOwner: "work", wantSrc: "192.168.50.7", wantDst: "100.88.1.4"},
 		{name: "reply from internet for exit we offer", proto: ipproto.TCP, src: "8.8.8.8:443", dst: "198.18.0.1:4000",
 			verdict: ToStack, wantOwner: "friends", wantSrc: "8.8.8.8", wantDst: "100.88.1.4"},
 		{name: "LAN source to tailnet without that route", proto: ipproto.TCP, src: "192.168.50.7:22", dst: "100.70.2.10:4000",
-			verdict: Drop, wantReason: "source not allowed"},
+			verdict: Drop, wantReason: DropSourceNotAllowed},
 		{name: "icmpv6 echo to friends remapped ipv6 peer", proto: ipproto.ICMPv6, src: "[fd7a:115c:a1e0::77]:0", dst: "[fd00:1::]:0",
 			verdict: ToStack, wantOwner: "friends", wantSrc: "fd7a:115c:a1e0::77", wantDst: "fd7a:115c:a1e0::99"},
 	})
@@ -180,21 +179,21 @@ func TestInbound(t *testing.T) {
 		{name: "friends peer to internet via our exit", owner: "friends", proto: ipproto.TCP, src: "100.88.1.4:4000", dst: "1.1.1.1:443",
 			verdict: ToHost, wantOwner: "friends", wantSrc: "198.18.0.1", wantDst: "1.1.1.1"},
 		{name: "isolation: friends peer to personal peer", owner: "friends", proto: ipproto.TCP, src: "100.88.1.4:4000", dst: "100.70.2.10:22",
-			verdict: Drop, wantReason: "destination not reachable"},
+			verdict: Drop, wantReason: DropDestinationNotReachable},
 		{name: "isolation: friends peer to personal remapped subnet", owner: "friends", proto: ipproto.TCP, src: "100.88.1.4:4000", dst: "198.19.3.4:22",
-			verdict: Drop, wantReason: "destination not reachable"},
+			verdict: Drop, wantReason: DropDestinationNotReachable},
 		{name: "isolation: friends peer to reserved range", owner: "friends", proto: ipproto.TCP, src: "100.88.1.4:4000", dst: "100.100.1.1:22",
-			verdict: Drop, wantReason: "destination not reachable"},
+			verdict: Drop, wantReason: DropDestinationNotReachable},
 		{name: "work does not get our exit", owner: "work", proto: ipproto.TCP, src: "100.88.1.4:4000", dst: "1.1.1.1:443",
-			verdict: Drop, wantReason: "destination not reachable"},
+			verdict: Drop, wantReason: DropDestinationNotReachable},
 		{name: "work peer to friends LAN-less self", owner: "work", proto: ipproto.TCP, src: "100.88.1.4:4000", dst: "192.168.99.1:22",
-			verdict: Drop, wantReason: "destination not reachable"},
+			verdict: Drop, wantReason: DropDestinationNotReachable},
 		{name: "unmapped source", owner: "work", proto: ipproto.TCP, src: "100.77.7.7:4000", dst: "100.101.5.2:22",
-			verdict: Drop, wantReason: "unmapped source"},
+			verdict: Drop, wantReason: DropUnmappedSource},
 		{name: "unknown tailnet", owner: "nobody", proto: ipproto.TCP, src: "100.88.1.4:4000", dst: "100.101.5.2:22",
-			verdict: Drop, wantReason: "unknown tailnet"},
+			verdict: Drop, wantReason: DropUnknownTailnet},
 		{name: "friends ipv6 peer", owner: "friends", proto: ipproto.ICMPv4, src: "[fd7a:115c:a1e0::99]:0", dst: "[fd7a:115c:a1e0::52]:0",
-			verdict: Drop, wantReason: "destination not reachable"},
+			verdict: Drop, wantReason: DropDestinationNotReachable},
 		{name: "work ipv6 peer", owner: "work", proto: ipproto.UDP, src: "[fd7a:115c:a1e0::99]:4000", dst: "[fd7a:115c:a1e0::52]:53",
 			verdict: ToHost, wantOwner: "work", wantSrc: "fd7a:115c:a1e0::99", wantDst: "fd7a:115c:a1e0::52"},
 		{name: "icmpv6 echo from friends remapped ipv6 peer", owner: "friends", proto: ipproto.ICMPv6, src: "[fd7a:115c:a1e0::99]:0", dst: "[fd7a:115c:a1e0::77]:0",
@@ -206,18 +205,109 @@ func TestInbound(t *testing.T) {
 		{name: "udp reply via personal exit node", owner: "personal", proto: ipproto.UDP, src: "8.8.4.4:53", dst: "100.70.2.9:4000",
 			verdict: ToHost, wantOwner: "personal", wantSrc: "8.8.4.4", wantDst: "198.18.0.0"},
 		{name: "exit stack impersonating friends remapped peer", owner: "personal", proto: ipproto.TCP, src: "198.18.0.1:443", dst: "100.70.2.9:4000",
-			verdict: Drop, wantReason: "unmapped source"},
+			verdict: Drop, wantReason: DropUnmappedSource},
 		{name: "exit stack impersonating work peer", owner: "personal", proto: ipproto.TCP, src: "100.88.1.4:443", dst: "100.70.2.9:4000",
-			verdict: Drop, wantReason: "unmapped source"},
+			verdict: Drop, wantReason: DropUnmappedSource},
 		{name: "exit stack impersonating work subnet host", owner: "personal", proto: ipproto.TCP, src: "172.20.1.1:443", dst: "100.70.2.9:4000",
-			verdict: Drop, wantReason: "unmapped source"},
+			verdict: Drop, wantReason: DropUnmappedSource},
 		{name: "exit stack sending from unmapped tailscale address", owner: "personal", proto: ipproto.TCP, src: "100.100.1.1:443", dst: "100.70.2.9:4000",
-			verdict: Drop, wantReason: "unmapped source"},
+			verdict: Drop, wantReason: DropUnmappedSource},
 		{name: "internet source from stack offering exit", owner: "friends", proto: ipproto.TCP, src: "1.1.1.1:443", dst: "100.99.0.1:4000",
-			verdict: Drop, wantReason: "unmapped source"},
+			verdict: Drop, wantReason: DropUnmappedSource},
 		{name: "internet source from stack without exit", owner: "work", proto: ipproto.UDP, src: "8.8.4.4:53", dst: "100.101.5.2:4000",
-			verdict: Drop, wantReason: "unmapped source"},
+			verdict: Drop, wantReason: DropUnmappedSource},
+		{name: "exit stack sending from private address", owner: "personal", proto: ipproto.TCP, src: "192.168.99.1:443", dst: "100.70.2.9:4000",
+			verdict: Drop, wantReason: DropUnmappedSource},
+		{name: "exit stack sending from loopback", owner: "personal", proto: ipproto.UDP, src: "127.0.0.1:53", dst: "100.70.2.9:4000",
+			verdict: Drop, wantReason: DropUnmappedSource},
 	})
+}
+
+// exitScenario is a translator with a stack x that uses an exit node, and
+// a stack y that routes a public subnet. All mappings are identity.
+//
+//	x: self 100.64.0.1, fd7a:115c:a1e0::1; peer 100.64.0.2
+//	y: self 100.64.0.5; routed subnet 198.51.100.0/24
+func exitScenario(t *testing.T) *Translator {
+	t.Helper()
+	now := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	tb, err := remap.New(remap.Config{Pool6: mpp("fd00:1::/48"), Now: func() time.Time { return now }}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tb.Sync("x", []netip.Prefix{mpp("100.64.0.1/32"), mpp("fd7a:115c:a1e0::1/128"), mpp("100.64.0.2/32")}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tb.Sync("y", []netip.Prefix{mpp("100.64.0.5/32"), mpp("198.51.100.0/24")}, now); err != nil {
+		t.Fatal(err)
+	}
+	tr := New(tb, reserved)
+	if err := tr.SetStacks([]Stack{
+		{Owner: "x", Self: []netip.Addr{mpa("100.64.0.1"), mpa("fd7a:115c:a1e0::1")}, UsesExit: true},
+		{Owner: "y", Self: []netip.Addr{mpa("100.64.0.5")}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return tr
+}
+
+// Review focus (R18): the exit stack may deliver unmapped sources only
+// when they are internet addresses: global unicast, not private, not
+// reserved and not unified-space. Anything else from an exit node would let
+// it pose as a host on the local network, the loopback, or a link peer.
+func TestExitSourceMustBeInternet(t *testing.T) {
+	tr := exitScenario(t)
+	for _, c := range []struct {
+		src  string
+		want Verdict
+	}{
+		{"1.1.1.1", ToHost},
+		{"203.0.113.9", ToHost},
+		{"172.32.0.1", ToHost}, // just outside 172.16.0.0/12
+		{"2606:4700:4700::1111", ToHost},
+		{"10.0.0.1", Drop},
+		{"172.16.0.1", Drop},
+		{"172.31.255.255", Drop},
+		{"192.168.1.1", Drop},
+		{"127.0.0.1", Drop},
+		{"0.0.0.0", Drop},
+		{"224.0.0.251", Drop},
+		{"239.255.255.250", Drop},
+		{"169.254.169.254", Drop},
+		{"255.255.255.255", Drop},
+		{"100.64.0.9", Drop},   // reserved
+		{"198.51.100.7", Drop}, // public, but in y's unified space
+		{"::1", Drop},
+		{"::", Drop},
+		{"ff02::1", Drop},
+		{"fe80::1", Drop},
+		{"fc00::1", Drop},
+		{"fd12:3456::1", Drop},
+		{"::ffff:1.1.1.1", Drop},    // IPv4-mapped: not an IPv6 internet address
+		{"::ffff:100.64.0.2", Drop}, // would dodge the reserved IPv4 ranges
+	} {
+		t.Run(c.src, func(t *testing.T) {
+			src := mpa(c.src)
+			dst := "100.64.0.1:4000"
+			if src.Is6() {
+				dst = "[fd7a:115c:a1e0::1]:4000"
+			}
+			b := pkt(ipproto.UDP, netip.AddrPortFrom(src, 53).String(), dst)
+			orig := string(b)
+			r := tr.Inbound("x", parse(b))
+			if r.Verdict != c.want {
+				t.Fatalf("Inbound = %+v, want %v", r, c.want)
+			}
+			if c.want == Drop {
+				if r.Reason != DropUnmappedSource {
+					t.Fatalf("reason = %q, want %q", r.Reason, DropUnmappedSource)
+				}
+				if string(b) != orig {
+					t.Fatal("dropped packet was modified")
+				}
+			}
+		})
+	}
 }
 
 // An ICMP error from an internet router, about a flow this host sent
@@ -257,7 +347,7 @@ func TestShortIPv4HeaderDropped(t *testing.T) {
 	b := pkt(ipproto.UDP, "100.88.1.4:4000", "100.99.0.1:53")
 	b[0] = 0x40 // header length 0: packet.Decode accepts it
 	orig := string(b)
-	if r := tr.Inbound("friends", parse(b)); r.Verdict != Drop || r.Reason != "malformed packet" {
+	if r := tr.Inbound("friends", parse(b)); r.Verdict != Drop || r.Reason != DropMalformedPacket {
 		t.Fatalf("Inbound = %+v", r)
 	}
 	if string(b) != orig {
@@ -296,7 +386,7 @@ func TestStaleParsedDropped(t *testing.T) {
 			b := c.stale[:len(c.stale)-3] // shorter than its IP length
 			orig := string(b)
 			q.Decode(b)
-			if r := translate(&q); r.Verdict != Drop || r.Reason != "malformed packet" {
+			if r := translate(&q); r.Verdict != Drop || r.Reason != DropMalformedPacket {
 				t.Fatalf("truncated packet = %+v, want drop: malformed packet", r)
 			}
 			if string(b) != orig {
@@ -358,7 +448,7 @@ func TestMalformedIPHeadersDropped(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			b, q := mk()
 			orig := string(b)
-			if r := tr.Outbound(q); r.Verdict != Drop || r.Reason != "malformed packet" {
+			if r := tr.Outbound(q); r.Verdict != Drop || r.Reason != DropMalformedPacket {
 				t.Fatalf("Outbound = %+v, want drop: malformed packet", r)
 			}
 			if string(b) != orig {
@@ -375,7 +465,7 @@ func TestUnknownOwnerFromMapper(t *testing.T) {
 	}
 	// 198.18.0.1 belongs to friends, which is no longer a stack.
 	q := parse(pkt(ipproto.TCP, "100.99.0.1:1", "198.18.0.1:2"))
-	if r := tr.Outbound(q); r.Verdict != Drop || r.Reason != "unknown tailnet" {
+	if r := tr.Outbound(q); r.Verdict != Drop || r.Reason != DropUnknownTailnet {
 		t.Fatalf("Outbound = %+v", r)
 	}
 }
@@ -396,10 +486,10 @@ func TestFamilyMismatchDropped(t *testing.T) {
 	tr.SetStacks([]Stack{{Owner: "a", Self: []netip.Addr{mpa("5.6.7.8")}, Advertised: []netip.Prefix{mpp("0.0.0.0/0")}}})
 	b := pkt(ipproto.TCP, "1.2.3.4:1", "5.6.7.8:2")
 	orig := string(b)
-	if r := tr.Inbound("a", parse(b)); r.Verdict != Drop || r.Reason != "address family mismatch" {
+	if r := tr.Inbound("a", parse(b)); r.Verdict != Drop || r.Reason != DropFamilyMismatch {
 		t.Fatalf("Inbound = %+v", r)
 	}
-	if r := tr.Outbound(parse(b)); r.Verdict != Drop || r.Reason != "address family mismatch" {
+	if r := tr.Outbound(parse(b)); r.Verdict != Drop || r.Reason != DropFamilyMismatch {
 		t.Fatalf("Outbound = %+v", r)
 	}
 	if string(b) != orig {
@@ -434,7 +524,7 @@ func TestQuotedFamilyMismatchDropped(t *testing.T) {
 	}
 	b := icmpErr("9.9.9.9", "5.6.7.8", pkt(ipproto.UDP, "5.6.7.8:1", "4.4.4.4:2"))
 	orig := string(b)
-	if r := tr.Inbound("a", parse(b)); r.Verdict != Drop || r.Reason != "address family mismatch" {
+	if r := tr.Inbound("a", parse(b)); r.Verdict != Drop || r.Reason != DropFamilyMismatch {
 		t.Fatalf("Inbound = %+v", r)
 	}
 	if string(b) != orig {
@@ -451,6 +541,29 @@ func TestSetStacksErrors(t *testing.T) {
 	} {
 		if err := tr.SetStacks(stacks); err == nil {
 			t.Errorf("%s: want error", name)
+		}
+	}
+}
+
+// Review focus (R17): callers act on typed reasons (the packet loop answers
+// DropNoRoute with an ICMP unreachable), and logs keep today's strings.
+func TestDropReasonString(t *testing.T) {
+	for r, want := range map[DropReason]string{
+		0:                           "",
+		DropMalformedPacket:         "malformed packet",
+		DropNoRoute:                 "no route",
+		DropUnknownTailnet:          "unknown tailnet",
+		DropSourceNotAllowed:        "source not allowed for tailnet",
+		DropFamilyMismatch:          "address family mismatch",
+		DropUnmappedSource:          "unmapped source",
+		DropDestinationNotReachable: "destination not reachable from tailnet",
+		DropMalformedICMPError:      "malformed ICMP error",
+		DropICMPErrorOutsideTailnet: "ICMP error quotes a flow outside the tailnet",
+		DropICMPRedirect:            "ICMP redirect or source quench",
+		200:                         "DropReason(200)",
+	} {
+		if got := r.String(); got != want {
+			t.Errorf("DropReason(%d).String() = %q, want %q", uint8(r), got, want)
 		}
 	}
 }

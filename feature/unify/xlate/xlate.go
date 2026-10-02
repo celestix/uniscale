@@ -7,7 +7,9 @@
 //
 // Translation is stateless and one-to-one: every decision is made from the
 // packet's own addresses, the remap table ([Mapper]), and per-tailnet
-// [Stack] information. Packets are rewritten in place.
+// [Stack] information. Packets are rewritten in place. Dropped packets are
+// left unmodified, with a [DropReason]. ICMP redirects and source quench
+// are always dropped: neither side may steer the other's routing.
 package xlate
 
 import (
@@ -64,14 +66,52 @@ func (v Verdict) String() string {
 	return fmt.Sprintf("Verdict(%d)", uint8(v))
 }
 
+// DropReason says why a packet was dropped. The zero DropReason is for
+// packets that were not dropped.
+type DropReason uint8
+
+const (
+	_                           DropReason = iota
+	DropMalformedPacket                    // not a well-formed IPv4 or IPv6 packet
+	DropNoRoute                            // destination in no tailnet, and no exit node for it
+	DropUnknownTailnet                     // the tailnet has no stack
+	DropSourceNotAllowed                   // outbound source that may not enter the tailnet
+	DropFamilyMismatch                     // an address would translate to the other family
+	DropUnmappedSource                     // inbound source with no unified-space address
+	DropDestinationNotReachable            // inbound destination the tailnet may not reach
+	DropMalformedICMPError                 // ICMP error whose quoted packet cannot be parsed
+	DropICMPErrorOutsideTailnet            // ICMP error quoting addresses that do not translate within the tailnet
+	DropICMPRedirect                       // ICMP redirect or source quench
+)
+
+var dropReasonStrings = [...]string{
+	DropMalformedPacket:         "malformed packet",
+	DropNoRoute:                 "no route",
+	DropUnknownTailnet:          "unknown tailnet",
+	DropSourceNotAllowed:        "source not allowed for tailnet",
+	DropFamilyMismatch:          "address family mismatch",
+	DropUnmappedSource:          "unmapped source",
+	DropDestinationNotReachable: "destination not reachable from tailnet",
+	DropMalformedICMPError:      "malformed ICMP error",
+	DropICMPErrorOutsideTailnet: "ICMP error quotes a flow outside the tailnet",
+	DropICMPRedirect:            "ICMP redirect or source quench",
+}
+
+func (r DropReason) String() string {
+	if int(r) < len(dropReasonStrings) {
+		return dropReasonStrings[r]
+	}
+	return fmt.Sprintf("DropReason(%d)", uint8(r))
+}
+
 // Result is the outcome of translating one packet.
 type Result struct {
 	Verdict Verdict
 	Owner   remap.Owner // set for ToStack and ToHost
-	Reason  string      // set for Drop
+	Reason  DropReason  // set for Drop
 }
 
-func drop(reason string) Result { return Result{Verdict: Drop, Reason: reason} }
+func drop(r DropReason) Result { return Result{Verdict: Drop, Reason: r} }
 
 type stackSet struct {
 	byOwner map[remap.Owner]Stack
@@ -123,34 +163,37 @@ func (t *Translator) SetStacks(stacks []Stack) error {
 // picks the stack to deliver it to.
 func (t *Translator) Outbound(q *packet.Parsed) Result {
 	if !wellFormed(q) {
-		return drop("malformed packet")
+		return drop(DropMalformedPacket)
+	}
+	if isRedirect(q) {
+		return drop(DropICMPRedirect)
 	}
 	ss := t.stacks.Load()
 	src, dst := q.Src.Addr(), q.Dst.Addr()
 	owner, realDst, ok := t.m.VirtualToReal(dst)
 	if !ok {
 		if ss.exit == "" || t.isReserved(dst) {
-			return drop("no route")
+			return drop(DropNoRoute)
 		}
 		owner, realDst = ss.exit, dst
 	}
 	st, ok := ss.byOwner[owner]
 	if !ok {
-		return drop("unknown tailnet")
+		return drop(DropUnknownTailnet)
 	}
 	newSrc, ok := t.outboundSrc(st, src)
 	if !ok {
-		return drop("source not allowed for tailnet")
+		return drop(DropSourceNotAllowed)
 	}
 	p := plan{src: newSrc, dst: realDst}
 	if q.IsError() {
-		var reason string
-		if p.quote, reason = t.outboundQuote(ss, st, q, src, newSrc); reason != "" {
+		var reason DropReason
+		if p.quote, reason = t.outboundQuote(ss, st, q, src, newSrc); reason != 0 {
 			return drop(reason)
 		}
 	}
 	if !p.apply(q) {
-		return drop("address family mismatch")
+		return drop(DropFamilyMismatch)
 	}
 	return Result{Verdict: ToStack, Owner: owner}
 }
@@ -178,31 +221,34 @@ func (t *Translator) outboundSrc(st Stack, src netip.Addr) (netip.Addr, bool) {
 // space for the host.
 func (t *Translator) Inbound(owner remap.Owner, q *packet.Parsed) Result {
 	if !wellFormed(q) {
-		return drop("malformed packet")
+		return drop(DropMalformedPacket)
+	}
+	if isRedirect(q) {
+		return drop(DropICMPRedirect)
 	}
 	ss := t.stacks.Load()
 	st, ok := ss.byOwner[owner]
 	if !ok {
-		return drop("unknown tailnet")
+		return drop(DropUnknownTailnet)
 	}
 	src, dst := q.Src.Addr(), q.Dst.Addr()
 	vsrc, ok := t.inboundAddr(ss, owner, src)
 	if !ok {
-		return drop("unmapped source")
+		return drop(DropUnmappedSource)
 	}
 	vdst, ok := t.inboundDst(st, dst)
 	if !ok {
-		return drop("destination not reachable from tailnet")
+		return drop(DropDestinationNotReachable)
 	}
 	p := plan{src: vsrc, dst: vdst}
 	if q.IsError() {
-		var reason string
-		if p.quote, reason = t.inboundQuote(ss, owner, q, dst, vdst); reason != "" {
+		var reason DropReason
+		if p.quote, reason = t.inboundQuote(ss, owner, q, dst, vdst); reason != 0 {
 			return drop(reason)
 		}
 	}
 	if !p.apply(q) {
-		return drop("address family mismatch")
+		return drop(DropFamilyMismatch)
 	}
 	return Result{Verdict: ToHost, Owner: owner}
 }
@@ -210,13 +256,14 @@ func (t *Translator) Inbound(owner remap.Owner, q *packet.Parsed) Result {
 // inboundAddr translates a, a remote address in owner's real space, into
 // the unified space. Mapped addresses are translated. The stack using an
 // exit node may also carry internet addresses (replies from the exit), which
-// are kept unchanged; reserved and unified-space addresses never are, so the
-// exit cannot impersonate a peer of any tailnet.
+// are kept unchanged; reserved, unified-space and non-internet addresses
+// never are, so the exit cannot impersonate a peer of any tailnet or a host
+// on this host's networks.
 func (t *Translator) inboundAddr(ss *stackSet, owner remap.Owner, a netip.Addr) (netip.Addr, bool) {
 	if v, ok := t.m.RealToVirtual(owner, a); ok {
 		return v, true
 	}
-	if owner != ss.exit || t.isReserved(a) {
+	if owner != ss.exit || !t.isInternet(a) {
 		return netip.Addr{}, false
 	}
 	if _, _, ok := t.m.VirtualToReal(a); ok {
@@ -268,6 +315,14 @@ func wellFormed(q *packet.Parsed) bool {
 }
 
 func (t *Translator) isReserved(a netip.Addr) bool { return containsAddr(t.reserved, a) }
+
+// isInternet reports whether a may be carried unchanged through an exit
+// node this host uses: a global unicast address that is neither private
+// (RFC 1918, ULA) nor reserved. IPv4-mapped IPv6 addresses are refused,
+// as they would escape the IPv4 reserved ranges.
+func (t *Translator) isInternet(a netip.Addr) bool {
+	return a.IsGlobalUnicast() && !a.IsPrivate() && !a.Is4In6() && !t.isReserved(a)
+}
 
 func containsAddr(ps []netip.Prefix, a netip.Addr) bool {
 	for _, p := range ps {

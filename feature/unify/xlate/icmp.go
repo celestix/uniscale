@@ -9,11 +9,30 @@ import (
 
 	"tailscale.com/feature/unify/remap"
 	"tailscale.com/net/packet"
+	"tailscale.com/types/ipproto"
 )
 
-// errQuote is the drop reason for an ICMP error whose quoted packet does
-// not belong to the tailnet the error travels through.
-const errQuote = "ICMP error quotes a flow outside the tailnet"
+// ICMP messages that ask the receiver to change how it routes or paces
+// traffic. A tailnet must not steer the host's routing, nor the host a
+// tailnet's, so they are dropped in both directions.
+const (
+	icmp4SourceQuench = 4   // RFC 792, deprecated by RFC 6633
+	icmp4Redirect     = 5   // RFC 792
+	icmp6Redirect     = 137 // RFC 4861
+)
+
+// isRedirect reports whether q is an ICMPv4 redirect or source quench or
+// an ICMPv6 redirect.
+func isRedirect(q *packet.Parsed) bool {
+	t := q.Transport()
+	switch q.IPProto {
+	case ipproto.ICMPv4:
+		return len(t) > 0 && (t[0] == icmp4Redirect || t[0] == icmp4SourceQuench)
+	case ipproto.ICMPv6:
+		return len(t) > 0 && t[0] == icmp6Redirect
+	}
+	return false
+}
 
 // quote is the start of the packet quoted in an ICMP error. That packet
 // travelled in the opposite direction to the error.
@@ -96,21 +115,21 @@ func (e quoteEdit) apply(q *packet.Parsed) {
 // quoted packet is one sent into owner, so it is in owner's real space,
 // and the error returns to its sender. Each quoted address is translated
 // on its own, so errors from any hop on the path work (PMTUD, traceroute).
-// It returns a drop reason if a quoted address cannot be translated within
-// owner's tailnet.
-func (t *Translator) inboundQuote(ss *stackSet, owner remap.Owner, q *packet.Parsed, dst, vdst netip.Addr) (quoteEdit, string) {
+// It returns a non-zero drop reason if a quoted address cannot be
+// translated within owner's tailnet.
+func (t *Translator) inboundQuote(ss *stackSet, owner remap.Owner, q *packet.Parsed, dst, vdst netip.Addr) (quoteEdit, DropReason) {
 	qt, ok := parseQuote(q)
 	if !ok {
-		return quoteEdit{}, "malformed ICMP error"
+		return quoteEdit{}, DropMalformedICMPError
 	}
 	if qt.src != dst {
-		return quoteEdit{}, errQuote
+		return quoteEdit{}, DropICMPErrorOutsideTailnet
 	}
 	qdst, ok := t.inboundAddr(ss, owner, qt.dst)
 	if !ok {
-		return quoteEdit{}, errQuote
+		return quoteEdit{}, DropICMPErrorOutsideTailnet
 	}
-	return quoteEdit{q: qt, src: vdst, dst: qdst}, ""
+	return quoteEdit{q: qt, src: vdst, dst: qdst}, 0
 }
 
 // outboundQuote decides the quoted addresses of an ICMP error the host
@@ -118,29 +137,31 @@ func (t *Translator) inboundQuote(ss *stackSet, owner remap.Owner, q *packet.Par
 // quoted packet came from st's tailnet, so its source must translate
 // within that tailnet. Its destination becomes newSrc when it is src and
 // is otherwise kept, as for errors from routers on paths this node
-// forwards. It returns a drop reason if the error must be dropped.
-func (t *Translator) outboundQuote(ss *stackSet, st Stack, q *packet.Parsed, src, newSrc netip.Addr) (quoteEdit, string) {
+// forwards. It returns a non-zero drop reason if the error must be
+// dropped.
+func (t *Translator) outboundQuote(ss *stackSet, st Stack, q *packet.Parsed, src, newSrc netip.Addr) (quoteEdit, DropReason) {
 	qt, ok := parseQuote(q)
 	if !ok {
-		return quoteEdit{}, "malformed ICMP error"
+		return quoteEdit{}, DropMalformedICMPError
 	}
 	qsrc, ok := t.outboundQuotedSrc(ss, st, qt.src)
 	if !ok {
-		return quoteEdit{}, errQuote
+		return quoteEdit{}, DropICMPErrorOutsideTailnet
 	}
 	qdst := qt.dst
 	if qdst == src {
 		qdst = newSrc
 	}
-	return quoteEdit{q: qt, src: qsrc, dst: qdst}, ""
+	return quoteEdit{q: qt, src: qsrc, dst: qdst}, 0
 }
 
 // outboundQuotedSrc translates s, the source of the packet quoted in an
 // outbound ICMP error to st, into st's real space. A unified-space address
-// must belong to st's tailnet. An unmapped address is kept if st is the
-// stack using an exit node, or under the source rules for traffic this node
-// forwards for st (advertised subnets, exit node offered), and is never a
-// reserved address.
+// must belong to st's tailnet. An unmapped address is kept if it is an
+// internet address and st is the stack using an exit node (as for the
+// replies [Translator.Inbound] accepts from it), or under the source rules
+// for traffic this node forwards for st (advertised subnets, exit node
+// offered), and is never a reserved address.
 func (t *Translator) outboundQuotedSrc(ss *stackSet, st Stack, s netip.Addr) (netip.Addr, bool) {
 	if owner, r, ok := t.m.VirtualToReal(s); ok {
 		if owner != st.Owner {
@@ -151,7 +172,7 @@ func (t *Translator) outboundQuotedSrc(ss *stackSet, st Stack, s netip.Addr) (ne
 	if t.isReserved(s) {
 		return netip.Addr{}, false
 	}
-	if st.Owner == ss.exit || st.OffersExit || containsAddr(st.Advertised, s) {
+	if st.OffersExit || containsAddr(st.Advertised, s) || (st.Owner == ss.exit && t.isInternet(s)) {
 		return s, true
 	}
 	return netip.Addr{}, false

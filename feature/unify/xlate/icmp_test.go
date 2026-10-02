@@ -97,7 +97,7 @@ func TestMalformedICMPErrors(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			b := mangle(icmpErr("100.99.0.1", "198.18.0.1", orig))
 			before := string(b)
-			if r := tr.Outbound(parse(b)); r.Verdict != Drop || r.Reason != "malformed ICMP error" {
+			if r := tr.Outbound(parse(b)); r.Verdict != Drop || r.Reason != DropMalformedICMPError {
 				t.Fatalf("Outbound = %+v, want drop: malformed ICMP error", r)
 			}
 			if string(b) != before {
@@ -109,7 +109,7 @@ func TestMalformedICMPErrors(t *testing.T) {
 		b := icmpErr("100.99.0.1", "198.18.0.1", orig)
 		b[3] = 0xff
 		before := string(b)
-		if r := tr.Outbound(parse(b)); r.Verdict != Drop || r.Reason != "malformed packet" {
+		if r := tr.Outbound(parse(b)); r.Verdict != Drop || r.Reason != DropMalformedPacket {
 			t.Fatalf("Outbound = %+v, want drop: malformed packet", r)
 		}
 		if string(b) != before {
@@ -122,7 +122,7 @@ func TestMalformedICMPErrors(t *testing.T) {
 		b := withIPv6FragHeader(icmpErr("fd7a:115c:a1e0::77", "fd00:1::", pkt(ipproto.UDP, "[fd00:1::]:5000", "[fd7a:115c:a1e0::77]:53")))
 		binary.BigEndian.PutUint16(b[4:], 4)
 		before := string(b)
-		if r := tr.Outbound(parse(b)); r.Verdict != Drop || r.Reason != "malformed ICMP error" {
+		if r := tr.Outbound(parse(b)); r.Verdict != Drop || r.Reason != DropMalformedICMPError {
 			t.Fatalf("Outbound = %+v, want drop: malformed ICMP error", r)
 		}
 		if string(b) != before {
@@ -138,7 +138,7 @@ func TestMalformedICMPErrors(t *testing.T) {
 		b := icmpErr("fd7a:115c:a1e0::2", "fd7a:115c:a1e0::1", orig)
 		b[48] = 0x40
 		before := string(b)
-		if r := tr.Inbound("a", parse(b)); r.Verdict != Drop || r.Reason != "malformed ICMP error" {
+		if r := tr.Inbound("a", parse(b)); r.Verdict != Drop || r.Reason != DropMalformedICMPError {
 			t.Fatalf("Inbound = %+v, want drop: malformed ICMP error", r)
 		}
 		if string(b) != before {
@@ -237,7 +237,7 @@ func runICMPErrors(t *testing.T, tr *Translator, cases []icmpErrCase) {
 			if c.verdict == Drop {
 				// Every drop in these tables is about the quoted packet; the
 				// outer addresses would be accepted.
-				if r.Reason != "ICMP error quotes a flow outside the tailnet" {
+				if r.Reason != DropICMPErrorOutsideTailnet {
 					t.Fatalf("reason = %q", r.Reason)
 				}
 				if string(c.b) != orig {
@@ -349,5 +349,96 @@ func TestOutboundICMPErrorQuote(t *testing.T) {
 			b: icmpErr("100.101.5.2", "100.88.1.4", pkt(ipproto.UDP, "8.8.8.8:5000", "100.101.5.2:53")), verdict: Drop},
 		{name: "ipv6 quoted source from another tailnet",
 			b: icmpErr("fd7a:115c:a1e0::77", "fd00:1::", pkt(ipproto.UDP, "[fd7a:115c:a1e0::99]:5000", "[fd7a:115c:a1e0::77]:53")), verdict: Drop},
+	})
+}
+
+// Review focus (R18): redirects and source quench tell the receiver to
+// change how it routes or paces traffic. One tailnet must not steer the
+// host's routing (or the host a tailnet's), so they are dropped both ways
+// even when their addresses would translate.
+func TestICMPRedirectAndSourceQuenchDropped(t *testing.T) {
+	tr := scenario(t)
+	v4out := pkt(ipproto.UDP, "198.18.0.1:5000", "100.99.0.1:53")
+	v4in := pkt(ipproto.UDP, "100.99.0.1:5000", "100.88.1.4:53")
+	v6out := pkt(ipproto.UDP, "[fd00:1::]:5000", "[fd7a:115c:a1e0::77]:53")
+	v6in := pkt(ipproto.UDP, "[fd7a:115c:a1e0::77]:5000", "[fd7a:115c:a1e0::99]:53")
+	const gw = 0x64580104 // 100.88.1.4, the redirect's gateway
+	cases := []struct {
+		name  string
+		owner remap.Owner // "" for Outbound
+		b     []byte
+	}{
+		{"outbound ipv4 redirect", "", icmpError(5, 1, gw, "100.99.0.1", "198.18.0.1", v4out)},
+		{"outbound ipv4 source quench", "", icmpError(4, 0, 0, "100.99.0.1", "198.18.0.1", v4out)},
+		{"inbound ipv4 redirect", "friends", icmpError(5, 1, gw, "100.88.1.4", "100.99.0.1", v4in)},
+		{"inbound ipv4 source quench", "friends", icmpError(4, 0, 0, "100.88.1.4", "100.99.0.1", v4in)},
+		{"outbound ipv6 redirect", "", icmpError(137, 0, 0, "fd7a:115c:a1e0::77", "fd00:1::", v6out)},
+		{"inbound ipv6 redirect", "friends", icmpError(137, 0, 0, "fd7a:115c:a1e0::99", "fd7a:115c:a1e0::77", v6in)},
+		{"inbound ipv6 redirect after fragment header", "friends",
+			withIPv6FragHeader(icmpError(137, 0, 0, "fd7a:115c:a1e0::99", "fd7a:115c:a1e0::77", v6in))},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if !checksumsOK(c.b) {
+				t.Fatal("test packet has bad checksums")
+			}
+			orig := string(c.b)
+			var r Result
+			if c.owner == "" {
+				r = tr.Outbound(parse(c.b))
+			} else {
+				r = tr.Inbound(c.owner, parse(c.b))
+			}
+			if r.Verdict != Drop || r.Reason != DropICMPRedirect {
+				t.Fatalf("got %+v, want drop: %v", r, DropICMPRedirect)
+			}
+			if string(c.b) != orig {
+				t.Fatal("dropped packet was modified")
+			}
+		})
+	}
+	// Neighbouring types are not affected: ICMPv4 type 6 (alternate host
+	// address, unassigned in practice) and ICMPv6 type 136 (neighbour
+	// advertisement) are translated like any other ICMP message.
+	for name, b := range map[string][]byte{
+		"ipv4 type 6":   icmpError(6, 0, 0, "100.99.0.1", "198.18.0.1", v4out),
+		"ipv6 type 136": icmpError(136, 0, 0, "fd7a:115c:a1e0::77", "fd00:1::", v6out),
+	} {
+		if r := tr.Outbound(parse(b)); r.Verdict != ToStack {
+			t.Errorf("%s: Outbound = %+v, want to-stack", name, r)
+		}
+	}
+	// A Parsed claiming ICMP without an ICMP header (not produced by
+	// packet.Decode) is not mistaken for a redirect and does not panic.
+	b := pkt(ipproto.ICMPv4, "100.99.0.1:0", "198.18.0.1:0")[:20]
+	binary.BigEndian.PutUint16(b[2:], 20)
+	q := parse(b)
+	q.IPProto = ipproto.ICMPv4
+	if r := tr.Outbound(q); r.Reason == DropICMPRedirect {
+		t.Fatalf("headerless ICMP: Outbound = %+v", r)
+	}
+}
+
+// Review focus (R18): an ICMP error from the exit stack quoting a flow to
+// a non-internet destination is dropped, as a packet from that address
+// would be; an error sent back through the exit may not quote one either.
+func TestExitICMPErrorQuotesInternetOnly(t *testing.T) {
+	runICMPErrors(t, exitScenario(t), []icmpErrCase{
+		{name: "inbound quoting an internet destination", owner: "x",
+			b:       tooBig("203.0.113.1", "100.64.0.1", pkt(ipproto.TCP, "100.64.0.1:4000", "1.1.1.1:443"), 1200),
+			verdict: ToHost, wantOwner: "x",
+			wantSrc: "203.0.113.1", wantDst: "100.64.0.1", wantQSrc: "100.64.0.1", wantQDst: "1.1.1.1"},
+		{name: "inbound quoting a private destination", owner: "x",
+			b: tooBig("203.0.113.1", "100.64.0.1", pkt(ipproto.TCP, "100.64.0.1:4000", "192.168.1.1:443"), 1200), verdict: Drop},
+		{name: "inbound quoting a link-local destination", owner: "x",
+			b: icmpErr("2606:4700::1", "fd7a:115c:a1e0::1", pkt(ipproto.UDP, "[fd7a:115c:a1e0::1]:4000", "[fe80::1]:53")), verdict: Drop},
+		{name: "outbound quoting an internet source",
+			b:       icmpErr("100.64.0.1", "1.1.1.1", pkt(ipproto.UDP, "1.1.1.1:53", "100.64.0.1:4000")),
+			verdict: ToStack, wantOwner: "x",
+			wantSrc: "100.64.0.1", wantDst: "1.1.1.1", wantQSrc: "1.1.1.1", wantQDst: "100.64.0.1"},
+		{name: "outbound quoting a private source",
+			b: icmpErr("100.64.0.1", "1.1.1.1", pkt(ipproto.UDP, "10.1.2.3:53", "100.64.0.1:4000")), verdict: Drop},
+		{name: "outbound quoting a ULA source",
+			b: icmpErr("fd7a:115c:a1e0::1", "2606:4700:4700::1111", pkt(ipproto.UDP, "[fd12::1]:53", "[fd7a:115c:a1e0::1]:4000")), verdict: Drop},
 	})
 }
