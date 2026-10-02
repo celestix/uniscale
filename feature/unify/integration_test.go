@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -414,18 +415,19 @@ func (th *testHost) virtualOf(owner remap.Owner, ps []netip.Prefix) []netip.Pref
 }
 
 // waitRouterConfig waits until the host router's last configuration has
-// exactly the given addresses and routes.
-func (th *testHost) waitRouterConfig(localAddrs, routes []netip.Prefix) {
+// exactly these local addresses, routes and route sources.
+func (th *testHost) waitRouterConfig(localAddrs, routes []netip.Prefix, sources map[netip.Prefix]netip.Addr) {
 	th.t.Helper()
 	var last *router.Config
 	if err := tstest.WaitFor(integrationTimeout, func() error {
 		last = th.router.last()
-		if last == nil || !slices.Equal(last.LocalAddrs, localAddrs) || !slices.Equal(last.Routes, routes) {
+		if last == nil || !slices.Equal(last.LocalAddrs, localAddrs) || !slices.Equal(last.Routes, routes) ||
+			!maps.Equal(last.RouteSources, sources) {
 			return errors.New("not yet")
 		}
 		return nil
 	}); err != nil {
-		th.t.Fatalf("host router config %+v\nwant LocalAddrs %v\nRoutes %v", last, localAddrs, routes)
+		th.t.Fatalf("host router config %+v\nwant LocalAddrs %v\nRoutes %v\nRouteSources %v", last, localAddrs, routes, sources)
 	}
 }
 
@@ -504,7 +506,24 @@ func TestIntegration(t *testing.T) {
 	}
 	wantAddrs := sortedPrefixes(vSelfA, vSelfB)
 	wantRoutes := sortedPrefixes(vPeerA, vPeerB, quad100)
-	th.waitRouterConfig(wantAddrs, wantRoutes)
+	// Each tailnet's peers prefer its virtual self of their family as
+	// source (spec section 5, outbound step 1), quad-100 the primary's.
+	wantSources := make(map[netip.Prefix]netip.Addr)
+	for _, c := range []struct{ routes, self []netip.Prefix }{
+		{vPeerA, vSelfA}, {vPeerB, vSelfB}, {quad100, vSelfA},
+	} {
+		for _, r := range c.routes {
+			src := first6(c.self)
+			if r.Addr().Is4() {
+				src = first4(c.self)
+			}
+			wantSources[r] = src
+		}
+	}
+	if wantSources[host32(b4peer)] != b4self || wantSources[host32(b6peer)] != b6self || len(wantSources) != 6 {
+		t.Fatalf("expected sources %v", wantSources)
+	}
+	th.waitRouterConfig(wantAddrs, wantRoutes, wantSources)
 
 	stA, stB := th.u.Stack(PrimaryName), th.u.Stack("b")
 	if sts := th.u.Stacks(); len(sts) != 2 || sts[0] != stA || sts[1] != stB {
@@ -601,7 +620,7 @@ func TestIntegration(t *testing.T) {
 	})
 
 	t.Run("host configuration", func(t *testing.T) { // item 4, and R8/R10
-		th.waitRouterConfig(wantAddrs, wantRoutes)
+		th.waitRouterConfig(wantAddrs, wantRoutes, wantSources)
 		if err := tstest.WaitFor(integrationTimeout, func() error {
 			if !slices.Contains(th.dns.Config().Nameservers, mpa("100.100.100.100")) {
 				return fmt.Errorf("host DNS %+v", th.dns.Config())
@@ -628,7 +647,7 @@ func TestIntegration(t *testing.T) {
 		th = startUnify(t, stateDir) // the backends start from their saved state
 		th.running(PrimaryName)
 		th.running("b")
-		th.waitRouterConfig(wantAddrs, wantRoutes)
+		th.waitRouterConfig(wantAddrs, wantRoutes, wantSources)
 		for _, c := range []struct {
 			name   string
 			ps, vs []netip.Prefix

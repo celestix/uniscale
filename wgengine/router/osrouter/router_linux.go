@@ -39,6 +39,7 @@ import (
 	"tailscale.com/types/preftype"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/linuxfw"
+	"tailscale.com/util/mak"
 	"tailscale.com/util/set"
 	"tailscale.com/version/distro"
 	"tailscale.com/wgengine/router"
@@ -103,6 +104,7 @@ type linuxRouter struct {
 	addrs             map[netip.Prefix]bool
 	lastScanAddrs     set.Set[netip.Prefix] // desired addrs at the last successful orphan scan; nil until the first scan
 	routes            map[netip.Prefix]bool
+	routeSrc          map[netip.Prefix]netip.Addr // preferred source applied to a route of routes; absent = none
 	localRoutes       map[netip.Prefix]bool
 	snatSubnetRoutes  bool
 	statefulFiltering bool
@@ -412,6 +414,7 @@ func (r *linuxRouter) Close() error {
 
 	r.addrs = nil
 	r.routes = nil
+	r.routeSrc = nil
 	r.localRoutes = nil
 
 	return nil
@@ -473,6 +476,11 @@ func (r *linuxRouter) Set(cfg *router.Config) error {
 		errs = append(errs, err)
 	}
 	r.routes = newRoutes
+	for p := range r.routeSrc {
+		if !r.routes[p] {
+			delete(r.routeSrc, p) // the route and its source are gone
+		}
+	}
 
 	prevAddrs := r.addrs
 	newAddrs, err := cidrDiff("addr", r.addrs, cfg.LocalAddrs, r.addAddress, r.delAddress, r.logf)
@@ -514,6 +522,12 @@ func (r *linuxRouter) Set(cfg *router.Config) error {
 				r.logf("router: removed %d stale Tailscale address(es) from %s left by a previous instance: %v", len(removed), r.tunname, removed)
 			}
 		}
+	}
+
+	// Route sources go last: the kernel rejects a source address the
+	// interface doesn't have yet.
+	if err := r.setRouteSourcesLocked(cfg); err != nil {
+		errs = append(errs, err)
 	}
 
 	// Ensure that the SNAT rule is added or removed as needed.
@@ -1205,6 +1219,117 @@ func (r *linuxRouter) addRoute(cidr netip.Prefix) error {
 	})
 }
 
+// setRouteSourcesLocked gives each route of r.routes the preferred source
+// cfg.RouteSources asks for, replacing the routes whose source differs from
+// the one last applied (r.routeSrc). It must run after cfg.LocalAddrs are
+// applied, because the kernel only accepts an address of the host as a
+// source. A source that is not the address of an applied cfg.LocalAddrs
+// entry, or not of the route's family, is ignored: the route gets none.
+//
+// It runs no commands when no route has or wants a source. A route whose
+// source fails to apply keeps its tracked source, so the next Set retries.
+// [linuxRouter.mu] must be held.
+func (r *linuxRouter) setRouteSourcesLocked(cfg *router.Config) error {
+	if len(cfg.RouteSources) == 0 && len(r.routeSrc) == 0 {
+		return nil
+	}
+	local := make(set.Set[netip.Addr])
+	for _, p := range cfg.LocalAddrs {
+		if r.addrs[p] {
+			local.Add(p.Addr())
+		}
+	}
+	var todo []netip.Prefix
+	for p := range r.routes {
+		if _, ok := cfg.RouteSources[p]; ok || r.routeSrc[p].IsValid() {
+			todo = append(todo, p)
+		}
+	}
+	tsaddr.SortPrefixes(todo)
+
+	var fails []error
+	for _, p := range todo {
+		src := cfg.RouteSources[p]
+		if src.IsValid() && (src.Is4() != p.Addr().Is4() || !local.Contains(src)) {
+			r.logf("route %v: ignoring source %v: not an applied local address of the route's family", p, src)
+			src = netip.Addr{}
+		}
+		if src == r.routeSrc[p] {
+			continue
+		}
+		if err := r.setRouteSource(p, src); err != nil {
+			r.logf("route %v: setting source %v failed: %v", p, src, err)
+			fails = append(fails, err)
+			continue
+		}
+		if src.IsValid() {
+			mak.Set(&r.routeSrc, p, src)
+		} else {
+			delete(r.routeSrc, p)
+		}
+	}
+	if len(fails) == 1 {
+		return fails[0]
+	}
+	if len(fails) > 0 {
+		return fmt.Errorf("%d route source failures; first was: %w", len(fails), fails[0])
+	}
+	return nil
+}
+
+// srcRetries and srcRetryDelay bound how long [linuxRouter.setRouteSource]
+// waits for a new IPv6 address to become usable as a route source.
+var (
+	srcRetries    = 50
+	srcRetryDelay = 10 * time.Millisecond
+)
+
+// setRouteSource replaces the route for cidr, as [linuxRouter.addRoute]
+// adds it, with one whose preferred source is src, or that has none if src
+// is the zero Addr. The kernel creates the route if it is missing.
+func (r *linuxRouter) setRouteSource(cidr netip.Prefix, src netip.Addr) error {
+	if !r.getV6Available() && cidr.Addr().Is6() {
+		return nil
+	}
+	err := r.replaceRoute(cidr, src)
+	// The kernel refuses an IPv6 address as a source while it is
+	// tentative, which a new address is for a moment even on a TUN, where
+	// duplicate address detection is skipped: the flag is cleared from a
+	// work queue after the address is added.
+	for i := 0; i < srcRetries && src.Is6() && errors.Is(err, errEINVAL); i++ {
+		time.Sleep(srcRetryDelay)
+		err = r.replaceRoute(cidr, src)
+	}
+	return err
+}
+
+// replaceRoute does the work of [linuxRouter.setRouteSource] once.
+func (r *linuxRouter) replaceRoute(cidr netip.Prefix, src netip.Addr) error {
+	if r.useIPCommand() {
+		args := []string{"ip", "route", "replace", normalizeCIDR(cidr), "dev", r.tunname}
+		if src.IsValid() {
+			args = append(args, "src", src.String())
+		}
+		if r.ipRuleAvailable {
+			args = append(args, "table", tailscaleRouteTable.ipCmdArg())
+		}
+		return r.cmd.run(args...)
+	}
+	linkIndex, err := r.linkIndex()
+	if err != nil {
+		return err
+	}
+	route := &netlink.Route{
+		LinkIndex: linkIndex,
+		Dst:       netipx.PrefixIPNet(cidr.Masked()),
+		Table:     r.routeTable(),
+	}
+	if src.IsValid() {
+		route.Src = src.AsSlice()
+	}
+	return netlink.RouteReplace(route)
+}
+
 // addThrowRoute adds a throw route for the provided cidr.
 // This has the effect that lookup in the routing table is terminated
 // pretending that no route was found. Fails if the route already exists,
@@ -1259,6 +1384,7 @@ var (
 	errESRCH  error = syscall.ESRCH
 	errENOENT error = syscall.ENOENT
 	errEEXIST error = syscall.EEXIST
+	errEINVAL error = syscall.EINVAL
 )
 
 // delRoute removes the route for cidr pointing to the tunnel

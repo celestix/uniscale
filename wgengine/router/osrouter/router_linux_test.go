@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"net"
 	"net/netip"
 	"os"
 	"reflect"
@@ -16,9 +17,12 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/tailscale/netlink"
 	"github.com/tailscale/wireguard-go/tun"
 	"go4.org/netipx"
@@ -1023,6 +1027,8 @@ type fakeOS struct {
 	ips    []string
 	routes []string
 	rules  []string
+	// calls is every command run, in order, as space-joined arguments.
+	calls []string
 	// This test tests on the router level, so we will not bother
 	// with using iptables or nftables, chose the simpler one.
 	nfr linuxfw.NetfilterRunner
@@ -1083,6 +1089,7 @@ func (o *fakeOS) String() string {
 }
 
 func (o *fakeOS) run(args ...string) error {
+	o.calls = append(o.calls, strings.Join(args, " "))
 	unexpected := func() error {
 		o.t.Errorf("unexpected invocation %q", strings.Join(args, " "))
 		return errors.New("unrecognized invocation")
@@ -1129,9 +1136,19 @@ func (o *fakeOS) run(args ...string) error {
 		return unexpected()
 	}
 
+	// same reports whether two entries of ls are the same entry. Routes
+	// match as in the kernel, regardless of their preferred source.
+	same := func(a, b string) bool { return a == b }
+	if args[1] == "route" {
+		same = func(a, b string) bool { return routeKey(a) == routeKey(b) }
+		if err := o.checkRouteSrc(rest); err != nil {
+			return err
+		}
+	}
+
 	switch args[2] {
 	case "add":
-		if slices.Contains(*ls, rest) {
+		if slices.ContainsFunc(*ls, func(e string) bool { return same(e, rest) }) {
 			// addAddress uses netlink AddrReplace in production, which is
 			// idempotent; model that for addresses rather than erroring.
 			// Routes/rules keep strict add semantics.
@@ -1143,14 +1160,24 @@ func (o *fakeOS) run(args ...string) error {
 		}
 		*ls = append(*ls, rest)
 		sort.Strings(*ls)
+	case "replace":
+		if args[1] != "route" {
+			return unexpected()
+		}
+		*ls = slices.DeleteFunc(*ls, func(e string) bool { return same(e, rest) })
+		*ls = append(*ls, rest)
+		sort.Strings(*ls)
 	case "del":
 		found := false
 		for i, el := range *ls {
-			if el == rest {
+			if same(el, rest) {
 				found = true
 				*ls = append((*ls)[:i], (*ls)[i+1:]...)
 				break
 			}
+		}
+		if found && args[1] == "addr" {
+			o.addrRemoved(rest)
 		}
 		if !found {
 			o.t.Logf("note: can't delete %q, not present", rest)
@@ -1174,8 +1201,68 @@ func (o *fakeOS) run(args ...string) error {
 	return nil
 }
 
+// routeKey returns the identity of a route entry of fakeOS.routes: the
+// entry without its preferred source ("src <addr>"), which the kernel does
+// not match on when replacing or deleting a route.
+func routeKey(route string) string {
+	f := strings.Fields(route)
+	if i := slices.Index(f, "src"); i >= 0 && i+1 < len(f) {
+		f = slices.Delete(f, i, i+2)
+	}
+	return strings.Join(f, " ")
+}
+
+// routeSrc returns the preferred source of a route entry, or "".
+func routeSrc(route string) string {
+	f := strings.Fields(route)
+	if i := slices.Index(f, "src"); i >= 0 && i+1 < len(f) {
+		return f[i+1]
+	}
+	return ""
+}
+
+// checkRouteSrc fails like the kernel when route asks for a preferred
+// source that is not an address of the host.
+func (o *fakeOS) checkRouteSrc(route string) error {
+	src := routeSrc(route)
+	if src == "" {
+		return nil
+	}
+	for _, e := range o.ips {
+		cidr, _, _ := strings.Cut(e, " ")
+		if p, err := netip.ParsePrefix(cidr); err == nil && p.Addr().String() == src {
+			return nil
+		}
+	}
+	return fmt.Errorf("RTNETLINK answers: Invalid argument (src %s not assigned)", src)
+}
+
+// addrRemoved models what the kernel does to routes when the address of
+// entry ("<cidr> dev <ifname>") is deleted: IPv4 routes using it as their
+// preferred source are flushed, IPv6 routes lose their preferred source.
+func (o *fakeOS) addrRemoved(entry string) {
+	cidr, _, _ := strings.Cut(entry, " ")
+	p, err := netip.ParsePrefix(cidr)
+	if err != nil {
+		return
+	}
+	src := p.Addr().String()
+	var routes []string
+	for _, r := range o.routes {
+		switch {
+		case routeSrc(r) != src:
+			routes = append(routes, r)
+		case p.Addr().Is6():
+			routes = append(routes, routeKey(r))
+		}
+	}
+	o.routes = routes
+	sort.Strings(o.routes)
+}
+
 func (o *fakeOS) output(args ...string) ([]byte, error) {
 	got := strings.Join(args, " ")
+	o.calls = append(o.calls, got)
 
 	if dev, ok := strings.CutPrefix(got, "ip -oneline addr show dev "); ok {
 		// Render o.ips (entries look like "<cidr> dev <ifname>") in a simplified
@@ -2111,4 +2198,673 @@ func TestCleanUpOnlyTouchesTunInterface(t *testing.T) {
 	if !slices.Contains(fake.ips, "100.64.0.5/32 dev eth0") {
 		t.Errorf("non-Tailscale CGNAT addr on eth0 was wrongly removed; ips=%q", fake.ips)
 	}
+}
+
+// routeSourceSteps are router configurations that add, change and remove
+// addresses and routes of both families, with a reset in between.
+func routeSourceSteps() []*Config {
+	return []*Config{
+		{
+			LocalAddrs:    mustCIDRs("100.64.0.2/32", "fd7a:115c:a1e0::2/128", "198.18.0.0/32"),
+			Routes:        mustCIDRs("100.64.0.1/32", "198.18.0.1/32", "fd7a:115c:a1e0::1/128", "10.0.0.0/24"),
+			NetfilterMode: netfilterOn,
+		},
+		{
+			LocalAddrs:    mustCIDRs("100.64.0.2/32", "fd7a:115c:a1e0::2/128", "198.18.0.4/32"),
+			Routes:        mustCIDRs("100.64.0.1/32", "198.18.0.5/32", "fd7a:115c:a1e0::1/128", "fd00:1::/64"),
+			NetfilterMode: netfilterOn,
+		},
+		nil,
+		{
+			LocalAddrs:    mustCIDRs("100.64.0.2/32"),
+			Routes:        mustCIDRs("100.64.0.1/32"),
+			NetfilterMode: netfilterOff,
+		},
+	}
+}
+
+// TestSetEmptyRouteSourcesUnchanged pins the commands Set runs for
+// configurations without route sources. A nil RouteSources, an empty one
+// and one naming only routes that are not in Routes all give exactly the
+// commands the router ran before route sources existed.
+func TestSetEmptyRouteSourcesUnchanged(t *testing.T) {
+	want := [][]string{
+		{
+			"ip -oneline addr show dev tailscale0",
+			"ip addr add 100.64.0.2/32 dev tailscale0",
+			"ip addr add 198.18.0.0/32 dev tailscale0",
+			"ip addr add fd7a:115c:a1e0::2/128 dev tailscale0",
+			"ip route add 10.0.0.0/24 dev tailscale0 table 52",
+			"ip route add 100.64.0.1/32 dev tailscale0 table 52",
+			"ip route add 198.18.0.1/32 dev tailscale0 table 52",
+			"ip route add fd7a:115c:a1e0::1/128 dev tailscale0 table 52",
+		},
+		{
+			"ip -oneline addr show dev tailscale0",
+			"ip addr add 198.18.0.4/32 dev tailscale0",
+			"ip addr del 198.18.0.0/32 dev tailscale0",
+			"ip route add 198.18.0.5/32 dev tailscale0 table 52",
+			"ip route add fd00:1::/64 dev tailscale0 table 52",
+			"ip route del 10.0.0.0/24 dev tailscale0 table 52",
+			"ip route del 198.18.0.1/32 dev tailscale0 table 52",
+		},
+		{
+			"ip -oneline addr show dev tailscale0",
+			"ip addr del 100.64.0.2/32 dev tailscale0",
+			"ip addr del 198.18.0.4/32 dev tailscale0",
+			"ip addr del fd7a:115c:a1e0::2/128 dev tailscale0",
+			"ip route del 100.64.0.1/32 dev tailscale0 table 52",
+			"ip route del 198.18.0.5/32 dev tailscale0 table 52",
+			"ip route del fd00:1::/64 dev tailscale0 table 52",
+			"ip route del fd7a:115c:a1e0::1/128 dev tailscale0 table 52",
+		},
+		{
+			"ip -oneline addr show dev tailscale0",
+			"ip addr add 100.64.0.2/32 dev tailscale0",
+			"ip route add 100.64.0.1/32 dev tailscale0 table 52",
+		},
+	}
+	for _, tc := range []struct {
+		name    string
+		sources map[netip.Prefix]netip.Addr
+	}{
+		{"nil", nil},
+		{"empty", map[netip.Prefix]netip.Addr{}},
+		{"unknown routes", map[netip.Prefix]netip.Addr{
+			netip.MustParsePrefix("100.64.0.9/32"):         netip.MustParseAddr("100.64.0.2"),
+			netip.MustParsePrefix("fd7a:115c:a1e0::9/128"): netip.MustParseAddr("fd7a:115c:a1e0::2"),
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lr, fake := newTestLinuxRouter(t)
+			var got [][]string
+			for i, cfg := range routeSourceSteps() {
+				if cfg != nil {
+					cfg.RouteSources = tc.sources
+				}
+				fake.calls = nil
+				if err := lr.Set(cfg); err != nil {
+					t.Fatalf("Set %d: %v", i, err)
+				}
+				// cidrDiff walks maps, so only the set of commands per
+				// Set is stable, not their order.
+				calls := slices.Clone(fake.calls)
+				slices.Sort(calls)
+				got = append(got, calls)
+			}
+			if d := cmp.Diff(want, got); d != "" {
+				t.Errorf("commands (-want +got):\n%s", d)
+			}
+		})
+	}
+}
+
+// routeSources builds a RouteSources map from route, source pairs.
+func routeSources(kv ...string) map[netip.Prefix]netip.Addr {
+	m := make(map[netip.Prefix]netip.Addr)
+	for i := 0; i < len(kv); i += 2 {
+		m[netip.MustParsePrefix(kv[i])] = netip.MustParseAddr(kv[i+1])
+	}
+	return m
+}
+
+// setCalls runs Set and returns the commands it ran, sorted.
+func setCalls(t *testing.T, lr *linuxRouter, fake *fakeOS, cfg *Config) []string {
+	t.Helper()
+	fake.calls = nil
+	if err := lr.Set(cfg); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	calls := slices.Clone(fake.calls)
+	slices.Sort(calls)
+	return calls
+}
+
+func wantRoutes(t *testing.T, fake *fakeOS, want ...string) {
+	t.Helper()
+	slices.Sort(want)
+	if d := cmp.Diff(want, fake.routes); d != "" {
+		t.Errorf("routes (-want +got):\n%s", d)
+	}
+}
+
+// replaceCalls returns the "ip route replace" commands of calls.
+func replaceCalls(calls []string) []string {
+	var out []string
+	for _, c := range calls {
+		if strings.HasPrefix(c, "ip route replace ") {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func TestSetRouteSources(t *testing.T) {
+	lr, fake := newTestLinuxRouter(t)
+	addrs := mustCIDRs(
+		"100.64.0.2/32", "fd7a:115c:a1e0::2/128", // tailnet a's self
+		"198.18.0.0/32", "fd00:1::/128", // tailnet b's virtual self
+	)
+	routes := mustCIDRs(
+		"100.64.0.1/32", "fd7a:115c:a1e0::1/128", // a's peer
+		"198.18.0.1/32", "fd00:1::1/128", // b's peer
+		"100.100.100.100/32", "fd7a:115c:a1e0::53/128", // quad-100
+		"10.0.0.0/24", // no source
+	)
+	cfg := func(addrs []netip.Prefix, routes []netip.Prefix, kv ...string) *Config {
+		return &Config{
+			LocalAddrs:    addrs,
+			Routes:        routes,
+			RouteSources:  routeSources(kv...),
+			NetfilterMode: netfilterOn,
+		}
+	}
+	first := cfg(addrs, routes,
+		"100.64.0.1/32", "100.64.0.2",
+		"fd7a:115c:a1e0::1/128", "fd7a:115c:a1e0::2",
+		"198.18.0.1/32", "198.18.0.0",
+		"fd00:1::1/128", "fd00:1::",
+		"100.100.100.100/32", "100.64.0.2",
+		"fd7a:115c:a1e0::53/128", "fd7a:115c:a1e0::2",
+	)
+
+	t.Run("after addresses", func(t *testing.T) {
+		fake.calls = nil
+		if err := lr.Set(first); err != nil {
+			t.Fatalf("Set: %v", err) // the fake rejects unassigned sources
+		}
+		calls := fake.calls
+		// Routes are added as before, then given their source once the
+		// address is on the interface.
+		for _, r := range routes {
+			addAt := slices.Index(calls, fmt.Sprintf("ip route add %s dev tailscale0 table 52", r))
+			if addAt < 0 {
+				t.Errorf("route %v not added; calls %q", r, calls)
+				continue
+			}
+			src, ok := first.RouteSources[r]
+			if !ok {
+				continue
+			}
+			repAt := slices.Index(calls, fmt.Sprintf("ip route replace %s dev tailscale0 src %s table 52", r, src))
+			addrAt := slices.IndexFunc(calls, func(c string) bool {
+				return strings.HasPrefix(c, fmt.Sprintf("ip addr add %s/", src))
+			})
+			if repAt < addAt || repAt < addrAt || addrAt < 0 {
+				t.Errorf("route %v: add at %d, address %v at %d, source at %d; calls %q", r, addAt, src, addrAt, repAt, calls)
+			}
+		}
+		if n := len(replaceCalls(calls)); n != len(first.RouteSources) {
+			t.Errorf("%d replace commands, want %d: %q", n, len(first.RouteSources), calls)
+		}
+		wantRoutes(t, fake,
+			"10.0.0.0/24 dev tailscale0 table 52",
+			"100.100.100.100/32 dev tailscale0 src 100.64.0.2 table 52",
+			"100.64.0.1/32 dev tailscale0 src 100.64.0.2 table 52",
+			"198.18.0.1/32 dev tailscale0 src 198.18.0.0 table 52",
+			"fd00:1::1/128 dev tailscale0 src fd00:1:: table 52",
+			"fd7a:115c:a1e0::1/128 dev tailscale0 src fd7a:115c:a1e0::2 table 52",
+			"fd7a:115c:a1e0::53/128 dev tailscale0 src fd7a:115c:a1e0::2 table 52",
+		)
+		// Setting the same configuration again changes nothing.
+		if calls := setCalls(t, lr, fake, first.Clone()); len(calls) != 0 {
+			t.Errorf("same config ran %q", calls)
+		}
+	})
+
+	t.Run("change and removal", func(t *testing.T) {
+		c := first.Clone()
+		c.RouteSources[netip.MustParsePrefix("100.100.100.100/32")] = netip.MustParseAddr("198.18.0.0")
+		delete(c.RouteSources, netip.MustParsePrefix("fd00:1::1/128"))
+		got := setCalls(t, lr, fake, c)
+		want := []string{
+			"ip route replace 100.100.100.100/32 dev tailscale0 src 198.18.0.0 table 52",
+			"ip route replace fd00:1::1/128 dev tailscale0 table 52",
+		}
+		if d := cmp.Diff(want, got); d != "" {
+			t.Errorf("commands (-want +got):\n%s", d)
+		}
+		wantRoutes(t, fake,
+			"10.0.0.0/24 dev tailscale0 table 52",
+			"100.100.100.100/32 dev tailscale0 src 198.18.0.0 table 52",
+			"100.64.0.1/32 dev tailscale0 src 100.64.0.2 table 52",
+			"198.18.0.1/32 dev tailscale0 src 198.18.0.0 table 52",
+			"fd00:1::1/128 dev tailscale0 table 52",
+			"fd7a:115c:a1e0::1/128 dev tailscale0 src fd7a:115c:a1e0::2 table 52",
+			"fd7a:115c:a1e0::53/128 dev tailscale0 src fd7a:115c:a1e0::2 table 52",
+		)
+	})
+
+	// b's virtual self moves. Deleting its old IPv4 address makes the
+	// kernel flush the routes using it as their source, and deleting the
+	// IPv6 one strips it from routes; the new sources bring them back.
+	moved := cfg(mustCIDRs("100.64.0.2/32", "fd7a:115c:a1e0::2/128", "198.18.0.4/32", "fd00:1::4/128"), routes,
+		"100.64.0.1/32", "100.64.0.2",
+		"fd7a:115c:a1e0::1/128", "fd7a:115c:a1e0::2",
+		"198.18.0.1/32", "198.18.0.4",
+		"fd00:1::1/128", "fd00:1::4",
+		"100.100.100.100/32", "198.18.0.4",
+		"fd7a:115c:a1e0::53/128", "fd00:1::4",
+	)
+	t.Run("self moves", func(t *testing.T) {
+		got := replaceCalls(setCalls(t, lr, fake, moved))
+		want := []string{
+			"ip route replace 100.100.100.100/32 dev tailscale0 src 198.18.0.4 table 52",
+			"ip route replace 198.18.0.1/32 dev tailscale0 src 198.18.0.4 table 52",
+			"ip route replace fd00:1::1/128 dev tailscale0 src fd00:1::4 table 52",
+			"ip route replace fd7a:115c:a1e0::53/128 dev tailscale0 src fd00:1::4 table 52",
+		}
+		if d := cmp.Diff(want, got); d != "" {
+			t.Errorf("replace commands (-want +got):\n%s", d)
+		}
+		wantRoutes(t, fake,
+			"10.0.0.0/24 dev tailscale0 table 52",
+			"100.100.100.100/32 dev tailscale0 src 198.18.0.4 table 52",
+			"100.64.0.1/32 dev tailscale0 src 100.64.0.2 table 52",
+			"198.18.0.1/32 dev tailscale0 src 198.18.0.4 table 52",
+			"fd00:1::1/128 dev tailscale0 src fd00:1::4 table 52",
+			"fd7a:115c:a1e0::1/128 dev tailscale0 src fd7a:115c:a1e0::2 table 52",
+			"fd7a:115c:a1e0::53/128 dev tailscale0 src fd00:1::4 table 52",
+		)
+	})
+
+	// A route that goes away takes its source with it: when it comes
+	// back, it gets its source again.
+	t.Run("route removal clears tracking", func(t *testing.T) {
+		without := moved.Clone()
+		without.Routes = slices.DeleteFunc(without.Routes, func(p netip.Prefix) bool {
+			return p == netip.MustParsePrefix("198.18.0.1/32") || p == netip.MustParsePrefix("fd00:1::1/128")
+		})
+		got := setCalls(t, lr, fake, without)
+		want := []string{
+			"ip route del 198.18.0.1/32 dev tailscale0 table 52",
+			"ip route del fd00:1::1/128 dev tailscale0 table 52",
+		}
+		if d := cmp.Diff(want, got); d != "" {
+			t.Errorf("commands (-want +got):\n%s", d)
+		}
+		for _, p := range mustCIDRs("198.18.0.1/32", "fd00:1::1/128") {
+			if src, ok := lr.routeSrc[p]; ok {
+				t.Errorf("removed route %v still tracked with source %v", p, src)
+			}
+		}
+		got = setCalls(t, lr, fake, moved.Clone())
+		want = []string{
+			"ip route add 198.18.0.1/32 dev tailscale0 table 52",
+			"ip route add fd00:1::1/128 dev tailscale0 table 52",
+			"ip route replace 198.18.0.1/32 dev tailscale0 src 198.18.0.4 table 52",
+			"ip route replace fd00:1::1/128 dev tailscale0 src fd00:1::4 table 52",
+		}
+		if d := cmp.Diff(want, got); d != "" {
+			t.Errorf("commands (-want +got):\n%s", d)
+		}
+	})
+
+	t.Run("reset", func(t *testing.T) {
+		setCalls(t, lr, fake, nil)
+		wantRoutes(t, fake)
+		if len(lr.routeSrc) != 0 {
+			t.Errorf("sources tracked after reset: %v", lr.routeSrc)
+		}
+		if got := replaceCalls(setCalls(t, lr, fake, first.Clone())); len(got) != len(first.RouteSources) {
+			t.Errorf("after reset, replace commands %q", got)
+		}
+	})
+
+	t.Run("close", func(t *testing.T) {
+		if err := lr.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if lr.routeSrc != nil {
+			t.Errorf("sources tracked after Close: %v", lr.routeSrc)
+		}
+	})
+}
+
+// TestSetRouteSourcesIgnored checks that sources the kernel would reject
+// are left out instead of failing Set, and that a route whose source
+// becomes unusable loses it.
+func TestSetRouteSourcesIgnored(t *testing.T) {
+	lr, fake := newTestLinuxRouter(t)
+	var logs tstest.MemLogger
+	lr.logf = logs.Logf
+	cfg := &Config{
+		LocalAddrs: mustCIDRs("100.64.0.2/32", "fd7a:115c:a1e0::2/128"),
+		Routes:     mustCIDRs("100.64.0.1/32", "100.64.0.3/32", "100.64.0.4/32", "fd7a:115c:a1e0::1/128"),
+		RouteSources: map[netip.Prefix]netip.Addr{
+			netip.MustParsePrefix("100.64.0.1/32"):         netip.MustParseAddr("fd7a:115c:a1e0::2"), // wrong family
+			netip.MustParsePrefix("100.64.0.3/32"):         netip.MustParseAddr("100.64.0.9"),        // not local
+			netip.MustParsePrefix("100.64.0.4/32"):         {},                                       // zero
+			netip.MustParsePrefix("fd7a:115c:a1e0::1/128"): netip.MustParseAddr("fd7a:115c:a1e0::2"),
+		},
+		NetfilterMode: netfilterOff,
+	}
+	got := replaceCalls(setCalls(t, lr, fake, cfg))
+	want := []string{"ip route replace fd7a:115c:a1e0::1/128 dev tailscale0 src fd7a:115c:a1e0::2 table 52"}
+	if d := cmp.Diff(want, got); d != "" {
+		t.Errorf("replace commands (-want +got):\n%s", d)
+	}
+	for _, w := range []string{
+		"route 100.64.0.1/32: ignoring source fd7a:115c:a1e0::2",
+		"route 100.64.0.3/32: ignoring source 100.64.0.9",
+	} {
+		if !strings.Contains(logs.String(), w) {
+			t.Errorf("no log %q in:\n%s", w, logs.String())
+		}
+	}
+	if strings.Contains(logs.String(), "100.64.0.4/32") {
+		t.Errorf("zero source logged:\n%s", logs.String())
+	}
+
+	// The IPv6 self goes away while the hint still names it: the route
+	// keeps working without a source.
+	cfg = cfg.Clone()
+	cfg.LocalAddrs = mustCIDRs("100.64.0.2/32")
+	got = replaceCalls(setCalls(t, lr, fake, cfg))
+	want = []string{"ip route replace fd7a:115c:a1e0::1/128 dev tailscale0 table 52"}
+	if d := cmp.Diff(want, got); d != "" {
+		t.Errorf("replace commands (-want +got):\n%s", d)
+	}
+	if len(lr.routeSrc) != 0 {
+		t.Errorf("tracked %v", lr.routeSrc)
+	}
+}
+
+// TestSetRouteSourcesV6Unavailable checks that IPv6 route sources are
+// skipped, like IPv6 routes and addresses, when IPv6 is unavailable.
+func TestSetRouteSourcesV6Unavailable(t *testing.T) {
+	lr, fake := newTestLinuxRouter(t)
+	fake.nfr.(*fakeIPTablesRunner).noV6 = true
+	cfg := &Config{
+		LocalAddrs:    mustCIDRs("100.64.0.2/32", "fd7a:115c:a1e0::2/128"),
+		Routes:        mustCIDRs("100.64.0.1/32", "fd7a:115c:a1e0::1/128"),
+		RouteSources:  routeSources("100.64.0.1/32", "100.64.0.2", "fd7a:115c:a1e0::1/128", "fd7a:115c:a1e0::2"),
+		NetfilterMode: netfilterOff,
+	}
+	got := replaceCalls(setCalls(t, lr, fake, cfg))
+	want := []string{"ip route replace 100.64.0.1/32 dev tailscale0 src 100.64.0.2 table 52"}
+	if d := cmp.Diff(want, got); d != "" {
+		t.Errorf("replace commands (-want +got):\n%s", d)
+	}
+	wantRoutes(t, fake, "100.64.0.1/32 dev tailscale0 src 100.64.0.2 table 52")
+}
+
+// TestSetRouteSourceFailure checks that a source the kernel refuses (for
+// example an IPv6 address whose duplicate address detection has not
+// finished) fails Set, leaves the route and its tracked source as they
+// were, and is applied by the next Set of the same configuration.
+func TestSetRouteSourceFailure(t *testing.T) {
+	lr, fake := newTestLinuxRouter(t)
+	route := netip.MustParsePrefix("fd7a:115c:a1e0::1/128")
+	self2, self3 := netip.MustParseAddr("fd7a:115c:a1e0::2"), netip.MustParseAddr("fd7a:115c:a1e0::3")
+	cfg := &Config{
+		LocalAddrs:    mustCIDRs("fd7a:115c:a1e0::2/128"),
+		Routes:        []netip.Prefix{route},
+		RouteSources:  map[netip.Prefix]netip.Addr{route: self2},
+		NetfilterMode: netfilterOff,
+	}
+	if err := lr.Set(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	// The source moves to a new address the kernel can't use yet.
+	cfg = cfg.Clone()
+	cfg.LocalAddrs = append(cfg.LocalAddrs, netip.PrefixFrom(self3, 128))
+	cfg.RouteSources[route] = self3
+	lr.cmd = pendingAddrRunner{fake, "ip addr add fd7a:115c:a1e0::3/128 dev tailscale0"}
+	err := lr.Set(cfg)
+	if err == nil || !strings.Contains(err.Error(), "Invalid argument") {
+		t.Fatalf("Set = %v, want the kernel's error", err)
+	}
+	if got := lr.routeSrc[route]; got != self2 {
+		t.Errorf("tracked source after failure = %v, want %v", got, self2)
+	}
+	wantRoutes(t, fake, "fd7a:115c:a1e0::1/128 dev tailscale0 src fd7a:115c:a1e0::2 table 52")
+
+	// The address is ready now: the same configuration applies the source.
+	fake.ips = append(fake.ips, "fd7a:115c:a1e0::3/128 dev tailscale0")
+	slices.Sort(fake.ips)
+	lr.cmd = fake
+	got := setCalls(t, lr, fake, cfg)
+	want := []string{"ip route replace fd7a:115c:a1e0::1/128 dev tailscale0 src fd7a:115c:a1e0::3 table 52"}
+	if d := cmp.Diff(want, got); d != "" {
+		t.Errorf("commands (-want +got):\n%s", d)
+	}
+	if got := lr.routeSrc[route]; got != self3 {
+		t.Errorf("tracked source = %v, want %v", got, self3)
+	}
+	wantRoutes(t, fake, "fd7a:115c:a1e0::1/128 dev tailscale0 src fd7a:115c:a1e0::3 table 52")
+}
+
+// pendingAddrRunner is a commandRunner whose command add succeeds
+// without adding the address to the fake OS, like an IPv6 address the
+// kernel does not accept as a route source until its duplicate address
+// detection finishes.
+type pendingAddrRunner struct {
+	*fakeOS
+	add string
+}
+
+func (r pendingAddrRunner) run(args ...string) error {
+	if cmd := strings.Join(args, " "); cmd == r.add {
+		r.calls = append(r.calls, cmd)
+		return nil
+	}
+	return r.fakeOS.run(args...)
+}
+
+// TestRouteSourcesNetlink applies route sources through netlink to a real
+// TUN and checks what the kernel stores and which source it picks. It
+// needs root; unshare -rn (a user and network namespace) also works. It
+// only uses documentation prefixes, and its ip rules match only those.
+func TestRouteSourcesNetlink(t *testing.T) {
+	fake := NewFakeOS(t)
+	lt, _ := newLinuxRootTest(t)
+	defer lt.Close()
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("router log:\n%s", lt.logOutput.String())
+		}
+	})
+	r := lt.r
+	r.nfr = fake.nfr
+	if !r.ipRuleAvailable {
+		t.Skip("no policy routing")
+	}
+	link, err := r.link()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, dst := range mustCIDRs("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32") {
+		rule := netlink.NewRule()
+		rule.Priority = 5280
+		rule.Table = tailscaleRouteTable.Num
+		rule.Dst = netipx.PrefixIPNet(dst)
+		rule.Family = netlink.FAMILY_V4
+		if dst.Addr().Is6() {
+			rule.Family = netlink.FAMILY_V6
+		}
+		if err := netlink.RuleAdd(rule); err != nil {
+			t.Fatalf("adding rule for %v: %v", dst, err)
+		}
+		defer netlink.RuleDel(rule)
+	}
+
+	// stored returns the preferred sources of the TUN's routes in table 52.
+	stored := func() map[netip.Prefix]netip.Addr {
+		t.Helper()
+		routes, err := netlink.RouteListFiltered(netlink.FAMILY_ALL,
+			&netlink.Route{Table: tailscaleRouteTable.Num, LinkIndex: link.Attrs().Index},
+			netlink.RT_FILTER_TABLE|netlink.RT_FILTER_OIF)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := make(map[netip.Prefix]netip.Addr)
+		for _, rt := range routes {
+			p, _ := netipx.FromStdIPNet(rt.Dst)
+			src, _ := netip.AddrFromSlice(rt.Src)
+			m[p] = src.Unmap()
+		}
+		return m
+	}
+	// picked returns the source the kernel picks for traffic to dst.
+	picked := func(dst string) netip.Addr {
+		t.Helper()
+		routes, err := netlink.RouteGet(net.ParseIP(dst))
+		if err != nil || len(routes) == 0 {
+			t.Fatalf("route get %v: %v %v", dst, routes, err)
+		}
+		src, _ := netip.AddrFromSlice(routes[0].Src)
+		return src.Unmap()
+	}
+	set := func(cfg *Config) {
+		t.Helper()
+		if err := r.Set(cfg); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+	}
+	a := netip.MustParseAddr
+	routes := mustCIDRs("192.0.2.2/32", "198.51.100.2/32", "2001:db8:a::2/128", "2001:db8:b::2/128", "203.0.113.0/24")
+	cfg := func(selfB4, selfB6 string, withSources bool) *Config {
+		c := &Config{
+			LocalAddrs:    mustCIDRs("192.0.2.1/32", "2001:db8:a::1/128", selfB4+"/32", selfB6+"/128"),
+			Routes:        routes,
+			NetfilterMode: netfilterOff,
+		}
+		if withSources {
+			c.RouteSources = routeSources(
+				"192.0.2.2/32", "192.0.2.1",
+				"2001:db8:a::2/128", "2001:db8:a::1",
+				"198.51.100.2/32", selfB4,
+				"2001:db8:b::2/128", selfB6,
+			)
+		}
+		return c
+	}
+	check := func(selfB4, selfB6 string) {
+		t.Helper()
+		want := map[netip.Prefix]netip.Addr{
+			netip.MustParsePrefix("192.0.2.2/32"):      a("192.0.2.1"),
+			netip.MustParsePrefix("2001:db8:a::2/128"): a("2001:db8:a::1"),
+			netip.MustParsePrefix("198.51.100.2/32"):   a(selfB4),
+			netip.MustParsePrefix("2001:db8:b::2/128"): a(selfB6),
+			netip.MustParsePrefix("203.0.113.0/24"):    {},
+		}
+		if d := cmp.Diff(want, stored(), cmpopts.EquateComparable(netip.Prefix{}, netip.Addr{})); d != "" {
+			t.Errorf("stored sources (-want +got):\n%s", d)
+		}
+		for dst, src := range map[string]netip.Addr{
+			"192.0.2.2": a("192.0.2.1"), "198.51.100.2": a(selfB4),
+			"2001:db8:a::2": a("2001:db8:a::1"), "2001:db8:b::2": a(selfB6),
+		} {
+			if got := picked(dst); got != src {
+				t.Errorf("kernel picks %v for %v, want %v", got, dst, src)
+			}
+		}
+	}
+
+	// The addresses are new: the sources go in right after them.
+	set(cfg("198.51.100.1", "2001:db8:b::1", true))
+	check("198.51.100.1", "2001:db8:b::1")
+
+	// b's self moves. Deleting its old IPv4 address flushes the routes
+	// that use it, deleting the IPv6 one clears it from routes.
+	set(cfg("198.51.100.3", "2001:db8:b::3", true))
+	check("198.51.100.3", "2001:db8:b::3")
+
+	// Without sources, the routes are as the router always made them.
+	set(cfg("198.51.100.3", "2001:db8:b::3", false))
+	for p, src := range stored() {
+		if src.IsValid() {
+			t.Errorf("route %v keeps source %v", p, src)
+		}
+	}
+	t.Logf("without sources the kernel picks %v for 192.0.2.2 and %v for 198.51.100.2", picked("192.0.2.2"), picked("198.51.100.2"))
+
+	set(nil)
+	if got := stored(); len(got) != 0 {
+		t.Errorf("routes left after reset: %v", got)
+	}
+}
+
+// TestSetRouteSourceTentative checks that an IPv6 source the kernel
+// refuses with EINVAL, as it does for a moment after the address is added
+// (while it is tentative), is retried a bounded number of times, and that
+// other failures are not.
+func TestSetRouteSourceTentative(t *testing.T) {
+	tstest.Replace(t, &srcRetryDelay, time.Microsecond)
+	tests := []struct {
+		name      string
+		src       string
+		refusals  int  // replace commands refused before one succeeds
+		wantTries int  // replace commands run
+		wantErr   bool // Set fails
+	}{
+		{"v6 ready after retries", "fd7a:115c:a1e0::2", 3, 4, false},
+		{"v6 never ready", "fd7a:115c:a1e0::2", 1000, srcRetries + 1, true},
+		{"v4 not retried", "100.64.0.2", 1000, 1, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lr, fake := newTestLinuxRouter(t)
+			src := netip.MustParseAddr(tt.src)
+			route := netip.PrefixFrom(src.Next(), src.BitLen())
+			runner := &refusingRunner{fakeOS: fake, refusals: tt.refusals}
+			lr.cmd = runner
+			err := lr.Set(&Config{
+				LocalAddrs:    []netip.Prefix{netip.PrefixFrom(src, src.BitLen())},
+				Routes:        []netip.Prefix{route},
+				RouteSources:  map[netip.Prefix]netip.Addr{route: src},
+				NetfilterMode: netfilterOff,
+			})
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Set = %v, want error %v", err, tt.wantErr)
+			}
+			if runner.tries != tt.wantTries {
+				t.Errorf("%d replace commands, want %d", runner.tries, tt.wantTries)
+			}
+			if got, want := lr.routeSrc[route].IsValid(), !tt.wantErr; got != want {
+				t.Errorf("source tracked = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+// TestSetRouteSourceFailures checks that Set reports every route whose
+// source fails, wrapping the first error, and tracks none of them.
+func TestSetRouteSourceFailures(t *testing.T) {
+	lr, fake := newTestLinuxRouter(t)
+	lr.cmd = &refusingRunner{fakeOS: fake, refusals: 1000}
+	err := lr.Set(&Config{
+		LocalAddrs:    mustCIDRs("100.64.0.2/32"),
+		Routes:        mustCIDRs("100.64.0.1/32", "100.64.0.3/32"),
+		RouteSources:  routeSources("100.64.0.1/32", "100.64.0.2", "100.64.0.3/32", "100.64.0.2"),
+		NetfilterMode: netfilterOff,
+	})
+	if err == nil || !strings.Contains(err.Error(), "2 route source failures") || !errors.Is(err, syscall.EINVAL) {
+		t.Errorf("Set = %v", err)
+	}
+	if len(lr.routeSrc) != 0 {
+		t.Errorf("tracked %v", lr.routeSrc)
+	}
+	wantRoutes(t, fake, "100.64.0.1/32 dev tailscale0 table 52", "100.64.0.3/32 dev tailscale0 table 52")
+}
+
+// refusingRunner is a commandRunner that refuses the first refusals
+// route replace commands with EINVAL, as the kernel does for a source
+// address that is still tentative.
+type refusingRunner struct {
+	*fakeOS
+	refusals int
+	tries    int
+}
+
+func (r *refusingRunner) run(args ...string) error {
+	if len(args) > 2 && args[1] == "route" && args[2] == "replace" {
+		r.tries++
+		if r.tries <= r.refusals {
+			return fmt.Errorf("RTNETLINK answers: %w", syscall.EINVAL)
+		}
+	}
+	return r.fakeOS.run(args...)
 }

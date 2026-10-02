@@ -5,6 +5,7 @@ package osglue
 
 import (
 	"net/netip"
+	"slices"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -27,6 +28,21 @@ func withQuad100(ss ...string) []netip.Prefix {
 	return pfxs(append(ss, quad100...)...)
 }
 
+// srcs builds RouteSources from lists of route, source pairs, or returns
+// nil if there are none.
+func srcs(lists ...[]string) map[netip.Prefix]netip.Addr {
+	var m map[netip.Prefix]netip.Addr
+	for _, kv := range lists {
+		for i := 0; i < len(kv); i += 2 {
+			if m == nil {
+				m = make(map[netip.Prefix]netip.Addr)
+			}
+			m[pfx(kv[i])] = netip.MustParseAddr(kv[i+1])
+		}
+	}
+	return m
+}
+
 func TestMergeRouter(t *testing.T) {
 	// Tailnets a (the primary) and b collide: both have a peer at
 	// 100.64.0.1 and this node at 100.64.0.2. b's are remapped.
@@ -40,6 +56,12 @@ func TestMergeRouter(t *testing.T) {
 		mapping("b", "100.64.0.1/32", "198.18.0.1/32"),
 		mapping("b", "10.0.0.0/24", "198.18.1.0/24"),
 		mapping("b", "100.64.0.5/32", "198.18.0.5/32"),
+		// e and f route the same virtual prefix (remap never does that).
+		mapping("e", "100.64.0.7/32", "100.64.0.7/32"),
+		mapping("e", "10.9.0.0/24", "10.9.0.0/24"),
+		mapping("e", "100.100.100.100/32", "100.100.100.100/32"),
+		mapping("f", "100.64.0.8/32", "100.64.0.8/32"),
+		mapping("f", "10.8.0.0/24", "10.9.0.0/24"),
 	}
 	a := func() Stack {
 		return Stack{
@@ -61,6 +83,13 @@ func TestMergeRouter(t *testing.T) {
 	both := []string{"10.0.0.0/24", "100.64.0.1/32", "198.18.0.1/32", "198.18.1.0/24"}
 	bothAddrs := pfxs("100.64.0.2/32", "198.18.0.2/32", "fd7a:115c:a1e0::2/128")
 
+	// Each stack's routes prefer its virtual self of their family; b
+	// has no IPv6 one. Quad-100 prefers the primary's.
+	srcA := []string{"10.0.0.0/24", "100.64.0.2", "100.64.0.1/32", "100.64.0.2"}
+	srcB := []string{"198.18.0.1/32", "198.18.0.2", "198.18.1.0/24", "198.18.0.2"}
+	srcQuad := []string{"100.100.100.100/32", "100.64.0.2", "fd7a:115c:a1e0::53/128", "fd7a:115c:a1e0::2"}
+	srcBoth := srcs(srcA, srcB, srcQuad)
+
 	tests := []struct {
 		name   string
 		stacks func() []Stack
@@ -75,8 +104,9 @@ func TestMergeRouter(t *testing.T) {
 			name:   "one stack",
 			stacks: func() []Stack { return []Stack{a()} },
 			want: &router.Config{
-				LocalAddrs: pfxs("100.64.0.2/32", "fd7a:115c:a1e0::2/128"),
-				Routes:     withQuad100("10.0.0.0/24", "100.64.0.1/32"),
+				LocalAddrs:   pfxs("100.64.0.2/32", "fd7a:115c:a1e0::2/128"),
+				Routes:       withQuad100("10.0.0.0/24", "100.64.0.1/32"),
+				RouteSources: srcs(srcA, srcQuad),
 			},
 		},
 		{
@@ -86,8 +116,9 @@ func TestMergeRouter(t *testing.T) {
 			name:   "two stacks",
 			stacks: func() []Stack { return []Stack{a(), b()} },
 			want: &router.Config{
-				LocalAddrs: bothAddrs,
-				Routes:     withQuad100(both...),
+				LocalAddrs:   bothAddrs,
+				Routes:       withQuad100(both...),
+				RouteSources: srcBoth,
 			},
 		},
 		{
@@ -100,8 +131,9 @@ func TestMergeRouter(t *testing.T) {
 				return []Stack{s}
 			},
 			want: &router.Config{
-				LocalAddrs: pfxs("100.64.0.2/32", "fd7a:115c:a1e0::2/128"),
-				Routes:     withQuad100("10.0.0.0/24"),
+				LocalAddrs:   pfxs("100.64.0.2/32", "fd7a:115c:a1e0::2/128"),
+				Routes:       withQuad100("10.0.0.0/24"),
+				RouteSources: srcs([]string{"10.0.0.0/24", "100.64.0.2"}, srcQuad),
 			},
 		},
 		{
@@ -114,8 +146,9 @@ func TestMergeRouter(t *testing.T) {
 				return []Stack{s}
 			},
 			want: &router.Config{
-				LocalAddrs: pfxs("100.64.0.2/32", "fd7a:115c:a1e0::2/128"),
-				Routes:     withQuad100("10.0.0.0/24", "100.64.0.1/32"),
+				LocalAddrs:   pfxs("100.64.0.2/32", "fd7a:115c:a1e0::2/128"),
+				Routes:       withQuad100("10.0.0.0/24", "100.64.0.1/32"),
+				RouteSources: srcs(srcA, srcQuad),
 			},
 		},
 		{
@@ -132,8 +165,9 @@ func TestMergeRouter(t *testing.T) {
 				return []Stack{s}
 			},
 			want: &router.Config{
-				LocalAddrs: pfxs("198.18.0.2/32"),
-				Routes:     withQuad100("198.18.0.1/32", "198.18.1.0/24"),
+				LocalAddrs:   pfxs("198.18.0.2/32"),
+				Routes:       withQuad100("198.18.0.1/32", "198.18.1.0/24"),
+				RouteSources: srcs(srcB), // no primary, no quad-100 source
 			},
 		},
 		{
@@ -154,6 +188,8 @@ func TestMergeRouter(t *testing.T) {
 				LocalAddrs:  bothAddrs,
 				Routes:      withQuad100(append([]string{"0.0.0.0/0", "::/0"}, both...)...),
 				LocalRoutes: pfxs("172.17.0.0/16", "192.168.1.0/24"),
+				// b has no IPv6 self: ::/0 gets no source.
+				RouteSources: srcs(srcA, srcB, srcQuad, []string{"0.0.0.0/0", "198.18.0.2"}),
 			},
 		},
 		{
@@ -164,8 +200,9 @@ func TestMergeRouter(t *testing.T) {
 				return []Stack{sa, sb}
 			},
 			want: &router.Config{
-				LocalAddrs: bothAddrs,
-				Routes:     withQuad100(both...),
+				LocalAddrs:   bothAddrs,
+				Routes:       withQuad100(both...),
+				RouteSources: srcBoth,
 			},
 		},
 		{
@@ -179,6 +216,7 @@ func TestMergeRouter(t *testing.T) {
 			want: &router.Config{
 				LocalAddrs:   bothAddrs,
 				Routes:       withQuad100(both...),
+				RouteSources: srcBoth,
 				SubnetRoutes: pfxs("10.0.0.0/24", "172.16.0.0/16", "192.168.1.0/24"),
 			},
 		},
@@ -193,6 +231,7 @@ func TestMergeRouter(t *testing.T) {
 			want: &router.Config{
 				LocalAddrs:        bothAddrs,
 				Routes:            withQuad100(both...),
+				RouteSources:      srcBoth,
 				SNATSubnetRoutes:  true,
 				StatefulFiltering: true,
 			},
@@ -206,8 +245,9 @@ func TestMergeRouter(t *testing.T) {
 				return []Stack{sa, sb}
 			},
 			want: &router.Config{
-				LocalAddrs: bothAddrs,
-				Routes:     withQuad100(both...),
+				LocalAddrs:   bothAddrs,
+				Routes:       withQuad100(both...),
+				RouteSources: srcBoth,
 			},
 		},
 		{
@@ -230,6 +270,7 @@ func TestMergeRouter(t *testing.T) {
 			want: &router.Config{
 				LocalAddrs:    bothAddrs,
 				Routes:        withQuad100(both...),
+				RouteSources:  srcBoth, // quad-100 from the primary, second here
 				NetfilterMode: preftype.NetfilterNoDivert,
 				NetfilterKind: "nftables",
 			},
@@ -252,6 +293,7 @@ func TestMergeRouter(t *testing.T) {
 			want: &router.Config{
 				LocalAddrs:          pfxs("198.18.0.2/32"),
 				Routes:              withQuad100("198.18.0.1/32", "198.18.1.0/24"),
+				RouteSources:        srcs(srcB),
 				NetfilterMode:       preftype.NetfilterOn,
 				NetfilterKind:       "nftables",
 				RemoveCGNATDropRule: true,
@@ -267,6 +309,7 @@ func TestMergeRouter(t *testing.T) {
 			want: &router.Config{
 				LocalAddrs:    bothAddrs,
 				Routes:        withQuad100(both...),
+				RouteSources:  srcBoth,
 				NetfilterMode: preftype.NetfilterOn,
 			},
 		},
@@ -280,9 +323,10 @@ func TestMergeRouter(t *testing.T) {
 				return []Stack{sa, sb, sc}
 			},
 			want: &router.Config{
-				LocalAddrs: bothAddrs,
-				Routes:     withQuad100(both...),
-				NewMTU:     1280,
+				LocalAddrs:   bothAddrs,
+				Routes:       withQuad100(both...),
+				RouteSources: srcBoth,
+				NewMTU:       1280,
 			},
 		},
 		{
@@ -294,6 +338,64 @@ func TestMergeRouter(t *testing.T) {
 				Routes: withQuad100(),
 			},
 		},
+		{
+			// The exit stack's own selves are the exit routes' sources.
+			name: "exit through primary",
+			stacks: func() []Stack {
+				sa := a()
+				sa.UsesExit = true
+				return []Stack{sa, b()}
+			},
+			want: &router.Config{
+				LocalAddrs: bothAddrs,
+				Routes:     withQuad100(append([]string{"0.0.0.0/0", "::/0"}, both...)...),
+				RouteSources: srcs(srcA, srcB, srcQuad,
+					[]string{"0.0.0.0/0", "100.64.0.2", "::/0", "fd7a:115c:a1e0::2"}),
+			},
+		},
+		{
+			// With several selves of a family, the smallest is the
+			// source, whatever their order.
+			name: "several selves",
+			stacks: func() []Stack {
+				s := a()
+				s.Self = pfxs("100.64.0.9/32", "fd7a:115c:a1e0::2/128", "100.64.0.2/32")
+				return []Stack{s}
+			},
+			want: &router.Config{
+				LocalAddrs:   pfxs("100.64.0.2/32", "100.64.0.9/32", "fd7a:115c:a1e0::2/128"),
+				Routes:       withQuad100("10.0.0.0/24", "100.64.0.1/32"),
+				RouteSources: srcs(srcA, srcQuad),
+			},
+		},
+		{
+			// A prefix two stacks route keeps the first one's source.
+			name: "shared route",
+			stacks: func() []Stack {
+				e := Stack{Owner: "e", Self: pfxs("100.64.0.7/32"), Subnets: pfxs("10.9.0.0/24")}
+				f := Stack{Owner: "f", Self: pfxs("100.64.0.8/32"), Subnets: pfxs("10.8.0.0/24")}
+				return []Stack{f, e}
+			},
+			want: &router.Config{
+				LocalAddrs:   pfxs("100.64.0.7/32", "100.64.0.8/32"),
+				Routes:       withQuad100("10.9.0.0/24"),
+				RouteSources: srcs([]string{"10.9.0.0/24", "100.64.0.8"}),
+			},
+		},
+		{
+			// The primary's selves serve quad-100 even if an earlier
+			// stack routes the address itself.
+			name: "quad-100 from primary only",
+			stacks: func() []Stack {
+				e := Stack{Owner: "e", Self: pfxs("100.64.0.7/32"), Subnets: pfxs("10.9.0.0/24", "100.100.100.100/32")}
+				return []Stack{e, a()}
+			},
+			want: &router.Config{
+				LocalAddrs:   pfxs("100.64.0.2/32", "100.64.0.7/32", "fd7a:115c:a1e0::2/128"),
+				Routes:       withQuad100("10.0.0.0/24", "10.9.0.0/24", "100.64.0.1/32"),
+				RouteSources: srcs(srcA, srcQuad, []string{"10.9.0.0/24", "100.64.0.7"}),
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -303,9 +405,10 @@ func TestMergeRouter(t *testing.T) {
 			for _, l := range []*[]netip.Prefix{&want.LocalAddrs, &want.Routes, &want.LocalRoutes, &want.SubnetRoutes} {
 				tsaddr.SortPrefixes(*l)
 			}
-			if d := cmp.Diff(want, got, cmpopts.EquateEmpty(), cmpopts.EquateComparable(netip.Prefix{})); d != "" {
+			if d := cmp.Diff(want, got, cmpopts.EquateEmpty(), cmpopts.EquateComparable(netip.Prefix{}, netip.Addr{})); d != "" {
 				t.Errorf("MergeRouter (-want +got):\n%s", d)
 			}
+			checkRouteSources(t, got)
 			// Merging is deterministic, so the real router's Equal
 			// check sees no change for the same input.
 			if again := MergeRouter(stacks, mappings); !again.Equal(got) {
@@ -326,5 +429,24 @@ func TestMergeRouterDoesNotAlias(t *testing.T) {
 	got.LocalRoutes[0] = pfx("1.2.3.4/32")
 	if captured.SubnetRoutes[0] != pfx("10.0.0.0/24") || captured.LocalRoutes[0] != pfx("192.168.1.0/24") {
 		t.Errorf("merged config aliases the captured one: %+v", captured)
+	}
+}
+
+// checkRouteSources checks what the Linux router needs of RouteSources:
+// every key is a route and every source an address of LocalAddrs of the
+// route's family. Without sources, the map is nil, as in configurations
+// that never had any.
+func checkRouteSources(t *testing.T, cfg *router.Config) {
+	t.Helper()
+	if cfg.RouteSources != nil && len(cfg.RouteSources) == 0 {
+		t.Error("empty non-nil RouteSources")
+	}
+	for r, src := range cfg.RouteSources {
+		if !slices.Contains(cfg.Routes, r) {
+			t.Errorf("source %v for %v, which is not a route", src, r)
+		}
+		if !slices.Contains(cfg.LocalAddrs, netip.PrefixFrom(src, src.BitLen())) || src.Is4() != r.Addr().Is4() {
+			t.Errorf("route %v: source %v is not a local address of its family", r, src)
+		}
 	}
 }

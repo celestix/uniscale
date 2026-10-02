@@ -8,6 +8,7 @@ package router
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net/netip"
 	"reflect"
 	"runtime"
@@ -115,6 +116,16 @@ type Config struct {
 	// this node has chosen to use.
 	Routes []netip.Prefix
 
+	// RouteSources optionally gives routes a preferred source address:
+	// the address the OS uses for traffic over the route when the sender
+	// did not bind one. A key is an entry of Routes; its value is the
+	// address of an entry of LocalAddrs, of the same family. Entries
+	// that don't fit are ignored. A route without an entry gets the OS's
+	// default choice.
+	//
+	// Only the Linux router applies it; other platforms ignore it.
+	RouteSources map[netip.Prefix]netip.Addr
+
 	// LocalRoutes are the routes that should not be routed through Tailscale.
 	// There are no priorities set in how these routes are added, normal
 	// routing rules apply.
@@ -159,6 +170,7 @@ func (c *Config) Clone() *Config {
 	c2 := *c
 	c2.LocalAddrs = slices.Clone(c.LocalAddrs)
 	c2.Routes = slices.Clone(c.Routes)
+	c2.RouteSources = maps.Clone(c.RouteSources)
 	c2.LocalRoutes = slices.Clone(c.LocalRoutes)
 	c2.SubnetRoutes = slices.Clone(c.SubnetRoutes)
 	return &c2

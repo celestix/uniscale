@@ -6,6 +6,7 @@ package unify
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/netip"
 	"os"
@@ -672,9 +673,20 @@ func TestRouting(t *testing.T) {
 	if !mpp("198.18.0.0/15").Contains(b4self) || !mpp(testPool6).Contains(b6self) {
 		t.Fatalf("b's self is not remapped: %v %v", b4self, b6self)
 	}
+	self4, self6 := mpa("100.64.0.2"), mpa("fd7a:115c:a1e0::2")
 	want := &router.Config{
-		LocalAddrs:       sortedPrefixes(selfPfx, []netip.Prefix{host32(b4self), host32(b6self)}),
-		Routes:           sortedPrefixes(peerPfx, quad100, []netip.Prefix{host32(b4peer), host32(b6peer)}),
+		LocalAddrs: sortedPrefixes(selfPfx, []netip.Prefix{host32(b4self), host32(b6self)}),
+		Routes:     sortedPrefixes(peerPfx, quad100, []netip.Prefix{host32(b4peer), host32(b6peer)}),
+		// Each tailnet's routes prefer its own address; quad-100 the
+		// primary's.
+		RouteSources: map[netip.Prefix]netip.Addr{
+			mpp("100.64.0.1/32"):          self4,
+			mpp("fd7a:115c:a1e0::1/128"):  self6,
+			host32(b4peer):                b4self,
+			host32(b6peer):                b6self,
+			mpp("100.100.100.100/32"):     self4,
+			mpp("fd7a:115c:a1e0::53/128"): self6,
+		},
 		NewMTU:           1280,
 		SNATSubnetRoutes: true,
 		NetfilterMode:    preftype.NetfilterOn,
@@ -720,6 +732,12 @@ func TestRouting(t *testing.T) {
 	cfg = h.waitRouter("b alone", func(c *router.Config) bool { return len(c.LocalAddrs) == 2 })
 	if !slices.Equal(cfg.LocalAddrs, sortedPrefixes([]netip.Prefix{host32(b4self), host32(b6self)})) {
 		t.Errorf("b alone: LocalAddrs %v", cfg.LocalAddrs)
+	}
+	// Quad-100 is still routed to the TUN, without a source: no tailnet
+	// serves it.
+	wantSrc := map[netip.Prefix]netip.Addr{host32(b4peer): b4self, host32(b6peer): b6self}
+	if !maps.Equal(cfg.RouteSources, wantSrc) {
+		t.Errorf("b alone: RouteSources %v, want %v", cfg.RouteSources, wantSrc)
 	}
 	q.Decode(udpPkt(ap(b4self, 5353), "100.100.100.100:53", []byte("q")))
 	if r := h.u.tr.Outbound(&q); r.Verdict != xlate.Drop {
@@ -800,12 +818,21 @@ func TestExitExclusive(t *testing.T) {
 	snap.UsesExit = true
 	captured := &router.Config{LocalRoutes: prefixes("192.168.1.0/24")}
 	h.stack("b").set(snap, captured)
-	h.waitRouter("b's exit", func(c *router.Config) bool { return hasAll(c.Routes, tsaddr.AllIPv4(), tsaddr.AllIPv6()) })
+	cfg := h.waitRouter("b's exit", func(c *router.Config) bool { return hasAll(c.Routes, tsaddr.AllIPv4(), tsaddr.AllIPv6()) })
+	// Internet traffic leaves from b's address in its tailnet.
+	b4self, b6self := h.virtual("b", mpa("100.64.0.2")), h.virtual("b", mpa("fd7a:115c:a1e0::2"))
+	if got4, got6 := cfg.RouteSources[tsaddr.AllIPv4()], cfg.RouteSources[tsaddr.AllIPv6()]; got4 != b4self || got6 != b6self {
+		t.Errorf("exit route sources %v, %v; want b's %v, %v", got4, got6, b4self, b6self)
+	}
 	h.stack(PrimaryName).set(snap, nil)
 	h.waitFor("warning", func() bool { return h.logs.count(`ignoring the exit node of [b]`) == 1 })
-	cfg := h.waitRouter("primary's exit", func(c *router.Config) bool { return len(c.LocalAddrs) == 4 })
+	cfg = h.waitRouter("primary's exit", func(c *router.Config) bool { return len(c.LocalAddrs) == 4 })
 	if len(cfg.LocalRoutes) != 0 {
 		t.Errorf("LocalRoutes = %v, want the primary's (none)", cfg.LocalRoutes)
+	}
+	// b mapped first here, so the primary's self is the remapped one.
+	if got, want := cfg.RouteSources[tsaddr.AllIPv4()], h.virtual(PrimaryName, mpa("100.64.0.2")); got != want {
+		t.Errorf("exit route source %v, want the primary's %v", got, want)
 	}
 	// The warning is not repeated while nothing changes.
 	h.stack(PrimaryName).set(snap, &router.Config{NewMTU: 1280})
