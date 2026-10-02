@@ -23,12 +23,14 @@ import (
 	"sync"
 
 	"github.com/tailscale/wireguard-go/tun"
+	"tailscale.com/client/local"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/store"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/netmon"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tsd"
 	"tailscale.com/types/logger"
@@ -214,14 +216,23 @@ func New(cfg Config) (_ *Stack, err error) {
 	if cfg.Dir != "" {
 		s.lb.SetVarRoot(cfg.Dir)
 	}
+	// Configure the web client to connect to this stack's socket, not the
+	// primary daemon's default socket.
+	if cfg.SocketPath != "" {
+		s.lb.ConfigureWebClient(&local.Client{
+			Socket:        cfg.SocketPath,
+			UseSocketOnly: true,
+		})
+	}
 
 	// The stack reaches its tailnet through netstack, never through the
 	// host: the host routes by unified addresses and could pick another
 	// tailnet.
 	lb := s.lb
 	s.dialer.UseNetstackForIP = func(ip netip.Addr) bool {
+		// Use netstack for known peers/routes or any Tailscale-range address.
 		_, ok := lb.PeerForIP(ip)
-		return ok
+		return ok || tsaddr.IsTailscaleIP(ip)
 	}
 	s.dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
 		return netConn(s.ns.DialContextTCPWithBind(ctx, s.selfAddr(dst.Addr()), dst))
@@ -286,6 +297,15 @@ func (s *Stack) LocalBackend() *ipnlocal.LocalBackend { return s.lb }
 func (s *Stack) Close() error {
 	s.closeOnce.Do(func() {
 		var errs []error
+		// Close the TUN device first so any blocked writes return, allowing
+		// netstack and the engine to shut down without hanging.
+		if s.sys != nil {
+			if tun, ok := s.sys.Tun.GetOK(); ok {
+				if tunDev := tun.Unwrap(); tunDev != nil {
+					tunDev.Close()
+				}
+			}
+		}
 		if s.ns != nil {
 			errs = append(errs, s.ns.Close())
 		}
@@ -304,7 +324,9 @@ func (s *Stack) Close() error {
 		if s.ec != nil {
 			s.ec.Close()
 		}
-		s.sys.Bus.Get().Close()
+		if s.sys != nil {
+			s.sys.Bus.Get().Close()
+		}
 		s.closeErr = errors.Join(errs...)
 	})
 	return s.closeErr
