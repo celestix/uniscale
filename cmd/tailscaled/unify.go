@@ -53,6 +53,15 @@ func runUnify(logf logger.Logf, logID logid.PublicID, sys *tsd.System) error {
 	if err := checkUnifyFlags(flag.CommandLine); err != nil {
 		return err
 	}
+	// handleTPMFlags has resolved these from the flags and policy. The
+	// secondary tailnets' state would be written in plaintext and
+	// attestation dropped, so fail closed.
+	if args.encryptState.v {
+		return errors.New("--unify does not support state encryption yet (set by --encrypt-state or the EncryptState policy)")
+	}
+	if args.hardwareAttestation.v {
+		return errors.New("--unify does not support hardware attestation yet (set by --hardware-attestation or the HardwareAttestation policy)")
+	}
 	opts := ipnServerOpts()
 	if opts.VarRoot == "" {
 		return errors.New("--unify needs a state directory; set --statedir")

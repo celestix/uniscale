@@ -109,9 +109,12 @@ func runDaemon(ctx context.Context, a tailscaledhooks.UnifyArgs, host hostDeps) 
 	}
 	d, err := host.newDNS(logf, a.Sys, devName)
 	if err != nil {
-		dev.Close()
-		r.Close()
-		return fmt.Errorf("unify: creating the OS DNS configurator: %w", err)
+		for _, ln := range lns {
+			ln.Close()
+		}
+		clear(lns)
+		// The router before the TUN, as Unify.Close does.
+		return errors.Join(fmt.Errorf("unify: creating the OS DNS configurator: %w", err), r.Close(), dev.Close())
 	}
 	opts := daemonOptions(a, cfg.Tailnets, st, dev, r, d)
 	if host.linkUp != nil {
@@ -126,8 +129,7 @@ func runDaemon(ctx context.Context, a tailscaledhooks.UnifyArgs, host hostDeps) 
 			ln.Close()
 		}
 		clear(lns)
-		u.Close()
-		return err
+		return errors.Join(err, u.Close())
 	}
 	served := lns
 	lns = nil // the servers close them

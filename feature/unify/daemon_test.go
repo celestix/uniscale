@@ -228,7 +228,7 @@ func (h *daemonHarness) status(ctx context.Context, name string) *ipnstate.Statu
 
 // checkClosed checks that every host part the daemon created was closed
 // exactly once and the sockets were removed. If ordered, the sockets must
-// close first, then the TUN, router and DNS configurator, in that order.
+// close first, then the router, DNS configurator and TUN, in that order.
 func (h *daemonHarness) checkClosed(ordered bool) {
 	h.t.Helper()
 	var sockets []string
@@ -478,6 +478,7 @@ func TestDaemonErrors(t *testing.T) {
 		live    bool     // builds live stacks
 		want    string   // in the error
 		created []string // the host parts created
+		ordered bool     // closes sockets, router, DNS, TUN in that order
 	}{
 		{name: "no system", mod: func(h *daemonHarness) { h.args.Sys = nil }, want: "system"},
 		{name: "no state directory", mod: func(h *daemonHarness) { h.args.StateDir = "" }, want: "--statedir"},
@@ -541,6 +542,7 @@ func TestDaemonErrors(t *testing.T) {
 			},
 			want:    "DNS",
 			created: append(slices.Clip(listens), "tun unify0", "router"),
+			ordered: true,
 		},
 		{
 			name:    "new",
@@ -554,6 +556,7 @@ func TestDaemonErrors(t *testing.T) {
 			live:    true,
 			want:    "boom",
 			created: append(slices.Clip(listens), "tun unify0", "router", "dns"),
+			ordered: true,
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -574,7 +577,12 @@ func TestDaemonErrors(t *testing.T) {
 			if got := h.getCreated(); !slices.Equal(got, c.created) {
 				t.Errorf("created %q, want %q", got, c.created)
 			}
-			h.checkClosed(false)
+			// Only the cases that fail after the host parts exist and
+			// close them in a fixed order are checked for it. The rest
+			// fail before any part exists, or inside New, which closes
+			// the parts itself while the deferred cleanup closes the
+			// sockets, so their relative order is not fixed.
+			h.checkClosed(c.ordered)
 		})
 	}
 }

@@ -1263,9 +1263,7 @@ func TestRemapSaveErrors(t *testing.T) {
 // the host TUN, after the host router is up and before any stack starts.
 func TestStartHostLinkUp(t *testing.T) {
 	var calls []string
-	var h *harness
-	h = mustHarness(t, func(h2 *harness) {
-		h = h2
+	h := mustHarness(t, func(h2 *harness) {
 		h2.opts.HostLinkUp = func(dev tun.Device) {
 			if d, ok := dev.(eventTUN); !ok || d.Device != h2.host {
 				t.Errorf("HostLinkUp(%v), want the host TUN", dev)

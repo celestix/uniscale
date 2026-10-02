@@ -39,7 +39,7 @@ func (t *Wrapper) SetLinkFeaturesPostUp(knobs *controlknobs.Knobs) {
 // by several tailnets, whose knobs are per tailnet), then probes for the
 // kernel bug that makes GRO writes fail with EINVAL and disables GRO if it
 // finds it. dev must be up, otherwise the probe may be inconclusive. It does
-// nothing if dev does not support GRO, and on other platforms than Linux.
+// nothing if dev does not support GRO, on Android, and on platforms other than Linux.
 func SetDeviceLinkFeaturesPostUp(dev tun.Device, knobs *controlknobs.Knobs, logf logger.Logf) {
 	setLinkFeaturesPostUp(dev, knobs, logf)
 }

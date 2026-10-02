@@ -101,3 +101,53 @@ func TestRunUnify(t *testing.T) {
 		t.Errorf("StatePath, Ephemeral = %q, %v", got.StatePath, got.Ephemeral)
 	}
 }
+
+// TestRunUnifyRejectsTPM checks that runUnify fails closed on the effective
+// --encrypt-state and --hardware-attestation values, which handleTPMFlags has
+// resolved from the flags and policy, as the secondary tailnets' state would
+// otherwise be written in plaintext and attestation silently dropped.
+func TestRunUnifyRejectsTPM(t *testing.T) {
+	saved := args
+	t.Cleanup(func() { args = saved })
+	var hookCalled bool
+	t.Cleanup(tailscaledhooks.Unify.SetForTest(func(context.Context, tailscaledhooks.UnifyArgs) error {
+		hookCalled = true
+		return errors.New("boom")
+	}))
+	sys := tsd.NewSystem()
+	defer sys.Bus.Get().Close()
+
+	for _, c := range []struct {
+		name    string
+		mod     func()
+		wantErr string // empty if runUnify should reach the hook
+	}{
+		{"encrypt-state", func() { args.encryptState = boolFlag{set: true, v: true} }, "state encryption"},
+		{"encrypt-state by policy", func() { args.encryptState = boolFlag{v: true} }, "state encryption"},
+		{"hardware-attestation", func() { args.hardwareAttestation = boolFlag{set: true, v: true} }, "hardware attestation"},
+		{"hardware-attestation by policy", func() { args.hardwareAttestation = boolFlag{v: true} }, "hardware attestation"},
+		{"encrypt-state=false", func() { args.encryptState = boolFlag{set: true} }, ""},
+		{"neither", func() {}, ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			args = saved
+			dir := t.TempDir()
+			args.statedir, args.statepath = dir, "mem:"
+			c.mod()
+			hookCalled = false
+			err := runUnify(t.Logf, logid.PublicID{3}, sys)
+			if c.wantErr == "" {
+				if !hookCalled || err == nil || !strings.Contains(err.Error(), "boom") {
+					t.Fatalf("runUnify = %v, hook called %v; want the hook's error", err, hookCalled)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "--unify does not support "+c.wantErr) {
+				t.Fatalf("runUnify = %v, want an error about %s", err, c.wantErr)
+			}
+			if hookCalled {
+				t.Error("hook called")
+			}
+		})
+	}
+}
