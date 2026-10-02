@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 
 	"github.com/tailscale/wireguard-go/tun"
@@ -45,6 +46,11 @@ type hostDeps struct {
 
 	// listen listens on a LocalAPI socket.
 	listen func(path string) (net.Listener, error)
+
+	// localPrefixes, if not nil, returns the host's local networks
+	// ([Options.LocalPrefixes]). If nil, unify reads the interfaces of
+	// tailscaled's network monitor.
+	localPrefixes func() []netip.Prefix
 }
 
 // runDaemon runs tailscaled in tailnet unification mode, as the
@@ -107,6 +113,13 @@ func runDaemon(ctx context.Context, a tailscaledhooks.UnifyArgs, host hostDeps) 
 		dev.Close()
 		return fmt.Errorf("unify: creating the router: %w", err)
 	}
+	// Start tailscaled's network monitor, as its engine would: no engine
+	// runs on it under --unify, and it reports nothing until started. The
+	// host router follows its ip rule deletions, and unify its link
+	// changes. Start is a no-op if the monitor already runs.
+	if nm, ok := a.Sys.NetMon.GetOK(); ok {
+		nm.Start()
+	}
 	d, err := host.newDNS(logf, a.Sys, devName)
 	if err != nil {
 		for _, ln := range lns {
@@ -117,6 +130,7 @@ func runDaemon(ctx context.Context, a tailscaledhooks.UnifyArgs, host hostDeps) 
 		return errors.Join(fmt.Errorf("unify: creating the OS DNS configurator: %w", err), r.Close(), dev.Close())
 	}
 	opts := daemonOptions(a, cfg.Tailnets, st, dev, r, d)
+	opts.LocalPrefixes = host.localPrefixes
 	if host.linkUp != nil {
 		opts.HostLinkUp = func(dev tun.Device) { host.linkUp(dev, logf) }
 	}

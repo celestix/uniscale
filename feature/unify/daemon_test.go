@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -438,6 +439,50 @@ func TestDaemonHostTUNFails(t *testing.T) {
 	err := h.wait(errc)
 	if !errors.Is(err, os.ErrClosed) || !strings.Contains(err.Error(), "host TUN") {
 		t.Fatalf("runDaemon = %v, want the host TUN's failure", err)
+	}
+	h.checkClosed(true)
+}
+
+// TestDaemonFollowsLinkChanges checks that the daemon starts tailscaled's
+// network monitor. Under --unify no engine runs on it, and a monitor
+// reports nothing until it is started: unify would never re-read the
+// host's local networks, nor the host router see ip rule deletions.
+func TestDaemonFollowsLinkChanges(t *testing.T) {
+	liveDaemonTest(t)
+	h := newDaemonHarness(t, "")
+	var reads atomic.Int32
+	h.host.localPrefixes = func() []netip.Prefix {
+		reads.Add(1)
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errc := h.run(ctx)
+	reqCtx, reqCancel := context.WithTimeout(ctx, testTimeout)
+	defer reqCancel()
+	h.status(reqCtx, PrimaryName)
+	waitReads := func(what string, n int32) {
+		t.Helper()
+		if err := tstest.WaitFor(testTimeout, func() error {
+			if got := reads.Load(); got < n {
+				return fmt.Errorf("%d reads of the local networks", got)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+	}
+	waitReads("at start", 1)
+
+	// A link change on tailscaled's monitor reaches unify, which reads the
+	// local networks again.
+	n := reads.Load()
+	h.args.Sys.NetMon.Get().InjectEvent()
+	waitReads("after a link change", n+1)
+
+	cancel()
+	if err := h.wait(errc); err != nil {
+		t.Fatalf("runDaemon = %v", err)
 	}
 	h.checkClosed(true)
 }
