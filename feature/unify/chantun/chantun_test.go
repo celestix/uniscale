@@ -257,3 +257,40 @@ func TestInjectWriteAfterCloseOnBufferedDevice(t *testing.T) {
 		}
 	}
 }
+
+// TryInject never blocks: a full queue loses the packet, so one slow stack
+// cannot hold up the loop that feeds every stack.
+func TestTryInject(t *testing.T) {
+	d := newDev(t, 4, 2)
+	for i := range 2 {
+		if err := d.TryInject([]byte{byte(i)}); err != nil {
+			t.Fatalf("TryInject #%d = %v", i, err)
+		}
+	}
+	for range 3 {
+		if err := d.TryInject([]byte{9}); !errors.Is(err, ErrFull) {
+			t.Fatalf("TryInject on a full queue = %v, want ErrFull", err)
+		}
+	}
+	got := readSlab(t, d, 1024, 4)
+	if len(got) != 2 || got[0][0] != 0 || got[1][0] != 1 {
+		t.Fatalf("read %q, want the two queued packets", got)
+	}
+	if err := d.TryInject([]byte{2}); err != nil {
+		t.Fatalf("TryInject after a read = %v", err)
+	}
+
+	d.Close()
+	for i := range 64 {
+		if err := d.TryInject([]byte("x")); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("TryInject #%d after Close = %v, want os.ErrClosed", i, err)
+		}
+	}
+}
+
+func TestTryInjectUnbuffered(t *testing.T) {
+	d := newDev(t, 1, 0)
+	if err := d.TryInject([]byte("x")); !errors.Is(err, ErrFull) {
+		t.Fatalf("TryInject with no reader = %v, want ErrFull", err)
+	}
+}

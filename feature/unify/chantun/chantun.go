@@ -5,8 +5,8 @@
 // tailnet stack to the unify packet loop.
 //
 // The stack uses a [Device] like any TUN device: it reads the packets the
-// loop injects with [Device.Inject] and writes packets that the loop
-// receives from [Device.Packets].
+// loop injects with [Device.Inject] or [Device.TryInject] and writes
+// packets that the loop receives from [Device.Packets].
 package chantun
 
 import (
@@ -19,6 +19,9 @@ import (
 
 	"github.com/tailscale/wireguard-go/tun"
 )
+
+// ErrFull is returned by [Device.TryInject] when the stack's queue is full.
+var ErrFull = errors.New("chantun: queue full")
 
 // Device is an in-memory tun.Device. It is safe for concurrent use.
 type Device struct {
@@ -72,6 +75,21 @@ func (d *Device) Inject(ctx context.Context, pkt []byte) error {
 		return ctx.Err()
 	case d.toStack <- pkt:
 		return nil
+	}
+}
+
+// TryInject queues pkt for the stack to read without blocking. It takes
+// ownership of pkt. It returns [ErrFull] if the queue is full, dropping
+// pkt, and os.ErrClosed once the device is closed.
+func (d *Device) TryInject(pkt []byte) error {
+	if d.closedNow() {
+		return os.ErrClosed
+	}
+	select {
+	case d.toStack <- pkt:
+		return nil
+	default:
+		return ErrFull
 	}
 }
 
