@@ -248,6 +248,11 @@ func (t *Translator) outboundSrc(st Stack, src netip.Addr) (netip.Addr, bool) {
 	if self, ok := t.realSelf(st, src); ok {
 		return self, true
 	}
+	if isQuad100(src) {
+		// Quad-100 reaches a stack only through the dedicated realSelf/quad-100
+		// destination branch, never as a source or quoted address (R7).
+		return netip.Addr{}, false
+	}
 	if _, _, ok := t.m.VirtualToReal(src); ok {
 		// A virtual address other than this stack's own self address: a
 		// peer's or another tailnet's. Never pass it into a stack.
@@ -324,6 +329,10 @@ func (t *Translator) inboundAddr(ss *stackSet, owner remap.Owner, a netip.Addr) 
 func (t *Translator) inboundDst(st Stack, dst netip.Addr) (netip.Addr, bool) {
 	if slices.Contains(st.Self, dst) {
 		return t.m.RealToVirtual(st.Owner, dst)
+	}
+	if isQuad100(dst) {
+		// Quad-100 is only reachable by the stack serving it (R7).
+		return netip.Addr{}, false
 	}
 	if _, _, ok := t.m.VirtualToReal(dst); ok {
 		// Unified-space address: reaching it would cross tailnets.

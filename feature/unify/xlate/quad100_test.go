@@ -4,6 +4,7 @@
 package xlate
 
 import (
+	"bytes"
 	"net/netip"
 	"testing"
 
@@ -142,4 +143,87 @@ func TestQuad100ICMPErrors(t *testing.T) {
 		{name: "outbound: quad-100 quoted to another stack",
 			b: icmpErr("100.99.0.1", "198.18.0.1", pkt(ipproto.UDP, "100.100.100.100:53", "100.99.0.1:4000")), verdict: Drop},
 	})
+}
+
+// Quad-100 is never sent or received by a non-serving stack, even if it
+// advertises a subnet covering quad-100 (R7 binding rule: only the serving
+// stack may send from quad-100, only to its own self).
+func TestQuad100IsolationFromNonServingStack(t *testing.T) {
+	tr := scenario(t)
+	// friends stack is NOT quad-100 owner, but advertises a subnet that covers quad-100 addresses
+	stacks := withQuad100(scenarioStacks(), "work")
+	stacks[2].Advertised = []netip.Prefix{
+		mpp("100.100.0.0/16"),      // covers 100.100.100.100
+		mpp("fd7a:115c:a1e0::/48"), // covers fd7a:115c:a1e0::53
+		mpp("192.168.0.0/16"),      // existing LAN
+	}
+	if err := tr.SetStacks(stacks); err != nil {
+		t.Fatal(err)
+	}
+
+	// (a) Outbound: host packet with src quad-100 to friends stack (should drop, unmodified)
+	b := pkt(ipproto.UDP, "100.100.100.100:4000", "100.99.0.1:5353")
+	savedB := bytes.Clone(b)
+	if r := tr.Outbound(parse(b)); r.Reason != DropSourceNotAllowed {
+		t.Errorf("Outbound with src=quad-100-v4 = %+v, want drop: %v", r, DropSourceNotAllowed)
+	}
+	if !bytes.Equal(b, savedB) {
+		t.Error("Outbound modified packet on drop")
+	}
+
+	// (a) IPv6 variant
+	b = pkt(ipproto.UDP, "[fd7a:115c:a1e0::53]:4000", "[fd7a:115c:a1e0::77]:5353")
+	savedB = bytes.Clone(b)
+	if r := tr.Outbound(parse(b)); r.Reason != DropSourceNotAllowed {
+		t.Errorf("Outbound with src=quad-100-v6 = %+v, want drop: %v", r, DropSourceNotAllowed)
+	}
+	if !bytes.Equal(b, savedB) {
+		t.Error("Outbound modified packet on drop")
+	}
+
+	// (b) Outbound ICMP error with outer src quad-100 (should drop, unmodified)
+	b = icmpErr("100.100.100.100", "100.99.0.1", pkt(ipproto.UDP, "100.99.0.1:4000", "100.88.1.4:5353"))
+	savedB = bytes.Clone(b)
+	if r := tr.Outbound(parse(b)); r.Reason != DropSourceNotAllowed {
+		t.Errorf("Outbound ICMP with outer src=quad-100 = %+v, want drop: %v", r, DropSourceNotAllowed)
+	}
+	if !bytes.Equal(b, savedB) {
+		t.Error("Outbound ICMP modified packet on drop")
+	}
+
+	// (c) Outbound ICMP error quoting dst quad-100 (should drop, unmodified)
+	b = icmpErr("100.99.0.1", "100.88.1.4", pkt(ipproto.UDP, "100.88.1.4:5353", "100.100.100.100:4000"))
+	savedB = bytes.Clone(b)
+	if r := tr.Outbound(parse(b)); r.Reason != DropSourceNotAllowed {
+		t.Errorf("Outbound ICMP quoting dst=quad-100 = %+v, want drop: %v", r, DropSourceNotAllowed)
+	}
+	if !bytes.Equal(b, savedB) {
+		t.Error("Outbound ICMP modified packet on drop")
+	}
+
+	// (d) Inbound from non-serving stack with dst quad-100 (should drop, unmodified)
+	b = pkt(ipproto.UDP, "100.99.0.1:4000", "100.100.100.100:5353")
+	savedB = bytes.Clone(b)
+	if r := tr.Inbound("friends", parse(b)); r.Reason != DropDestinationNotReachable {
+		t.Errorf("Inbound from friends with dst=quad-100-v4 = %+v, want drop: %v", r, DropDestinationNotReachable)
+	}
+	if !bytes.Equal(b, savedB) {
+		t.Error("Inbound modified packet on drop")
+	}
+
+	// (d) IPv6 variant
+	b = pkt(ipproto.UDP, "[fd7a:115c:a1e0::77]:4000", "[fd7a:115c:a1e0::53]:5353")
+	savedB = bytes.Clone(b)
+	if r := tr.Inbound("friends", parse(b)); r.Reason != DropDestinationNotReachable {
+		t.Errorf("Inbound from friends with dst=quad-100-v6 = %+v, want drop: %v", r, DropDestinationNotReachable)
+	}
+	if !bytes.Equal(b, savedB) {
+		t.Error("Inbound modified packet on drop")
+	}
+
+	// (e) Serving stack's normal quad-100 flows still pass
+	b = pkt(ipproto.UDP, "100.101.5.2:4000", "100.100.100.100:53")
+	if r := tr.Outbound(parse(b)); r.Verdict != ToStack || r.Owner != "work" {
+		t.Errorf("Outbound from work to quad-100 = %+v, want ToStack/work", r)
+	}
 }
