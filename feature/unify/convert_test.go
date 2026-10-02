@@ -51,9 +51,12 @@ func TestPlanRouting(t *testing.T) {
 	withExit := func(s ipnlocal.RoutingSnapshot) ipnlocal.RoutingSnapshot { s.UsesExit = true; return s }
 	withState := func(s ipnlocal.RoutingSnapshot, st ipn.State) ipnlocal.RoutingSnapshot { s.State = st; return s }
 
+	withOffer := func(s ipnlocal.RoutingSnapshot) ipnlocal.RoutingSnapshot { s.OffersExit = true; return s }
+
 	type want struct {
-		plans       []tailnetRouting
-		exitIgnored []remap.Owner
+		plans        []tailnetRouting
+		exitIgnored  []remap.Owner
+		offerIgnored []remap.Owner
 	}
 	for _, c := range []struct {
 		name string
@@ -141,6 +144,66 @@ func TestPlanRouting(t *testing.T) {
 			},
 		},
 		{
+			// C1: like stock tailscaled, this node does not offer to be an
+			// exit node while it uses one: the exit clients' internet
+			// traffic would leave through the used exit node, as this node
+			// of another tailnet.
+			name: "an exit in use clears the other tailnets' exit offers",
+			in: []tailnetState{
+				{owner: "default", primary: true, snap: withOffer(running(workSelf, nil, nil))}, // before the user
+				{owner: "home", snap: withExit(running(homeSelf, nil, nil))},
+				{owner: "c", snap: withOffer(running(prefixes("100.64.0.3/32"), nil, nil))},
+				{owner: "d", snap: withExit(running(prefixes("100.64.0.4/32"), nil, nil))}, // ignored exit, no offer
+				{owner: "e", snap: withState(withOffer(running(prefixes("100.64.0.5/32"), nil, nil)), ipn.Stopped)},
+			},
+			want: want{
+				plans: []tailnetRouting{
+					{owner: "default", running: true, sync: workSelf,
+						xlate: xlate.Stack{Owner: "default", Self: addrs("100.101.5.2", "fd7a:115c:a1e0::52"), Quad100: true},
+						merge: osglue.Stack{Owner: "default", Primary: true, Self: workSelf}},
+					{owner: "home", running: true, sync: homeSelf,
+						xlate: xlate.Stack{Owner: "home", Self: addrs("100.70.2.9"), UsesExit: true},
+						merge: osglue.Stack{Owner: "home", Self: homeSelf, UsesExit: true}},
+					{owner: "c", running: true, sync: prefixes("100.64.0.3/32"),
+						xlate: xlate.Stack{Owner: "c", Self: addrs("100.64.0.3")},
+						merge: osglue.Stack{Owner: "c", Self: prefixes("100.64.0.3/32")}},
+					{owner: "d", running: true, sync: prefixes("100.64.0.4/32"),
+						xlate: xlate.Stack{Owner: "d", Self: addrs("100.64.0.4")},
+						merge: osglue.Stack{Owner: "d", Self: prefixes("100.64.0.4/32")}},
+					{owner: "e"},
+				},
+				exitIgnored:  []remap.Owner{"d"},
+				offerIgnored: []remap.Owner{"default", "c"},
+			},
+		},
+		{
+			// Stock tailscaled refuses this combination in one backend; if
+			// a snapshot has it anyway, the exit node's own tailnet keeps
+			// both: nothing crosses tailnets.
+			name: "the exit user keeps its own offer",
+			in: []tailnetState{
+				{owner: "home", snap: withOffer(withExit(running(homeSelf, nil, nil)))},
+			},
+			want: want{plans: []tailnetRouting{
+				{owner: "home", running: true, sync: homeSelf,
+					xlate: xlate.Stack{Owner: "home", Self: addrs("100.70.2.9"), OffersExit: true, UsesExit: true},
+					merge: osglue.Stack{Owner: "home", Self: homeSelf, UsesExit: true}},
+			}},
+		},
+		{
+			name: "offers stay without an exit in use",
+			in: []tailnetState{
+				{owner: "home", snap: withState(withExit(running(homeSelf, nil, nil)), ipn.Stopped)},
+				{owner: "c", snap: withOffer(running(prefixes("100.64.0.3/32"), nil, nil))},
+			},
+			want: want{plans: []tailnetRouting{
+				{owner: "home"},
+				{owner: "c", running: true, sync: prefixes("100.64.0.3/32"),
+					xlate: xlate.Stack{Owner: "c", Self: addrs("100.64.0.3"), OffersExit: true},
+					merge: osglue.Stack{Owner: "c", Self: prefixes("100.64.0.3/32")}},
+			}},
+		},
+		{
 			name: "exit of a stopped tailnet does not count",
 			in: []tailnetState{
 				{owner: "home", snap: withState(withExit(running(homeSelf, nil, nil)), ipn.Stopped)},
@@ -216,12 +279,15 @@ func TestPlanRouting(t *testing.T) {
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			plans, ignored := planRouting(c.in)
+			plans, ignored, offerIgnored := planRouting(c.in)
 			if !reflect.DeepEqual(plans, c.want.plans) {
 				t.Errorf("plans:\n got %s\nwant %s", fmtPlans(plans), fmtPlans(c.want.plans))
 			}
 			if !reflect.DeepEqual(ignored, c.want.exitIgnored) {
 				t.Errorf("exitIgnored = %v, want %v", ignored, c.want.exitIgnored)
+			}
+			if !reflect.DeepEqual(offerIgnored, c.want.offerIgnored) {
+				t.Errorf("offerIgnored = %v, want %v", offerIgnored, c.want.offerIgnored)
 			}
 			// The xlate stacks of the running tailnets must be accepted
 			// as a set: one exit, one quad-100, unique owners.
@@ -251,8 +317,8 @@ func TestPlanRoutingDoesNotAlias(t *testing.T) {
 		Subnets:    prefixes("10.0.0.0/8"),
 		Advertised: prefixes("192.168.1.0/24"),
 	}
-	plans, _ := planRouting([]tailnetState{{owner: "a", primary: true, snap: snap}})
-	want, _ := planRouting([]tailnetState{{owner: "a", primary: true, snap: ipnlocal.RoutingSnapshot{
+	plans, _, _ := planRouting([]tailnetState{{owner: "a", primary: true, snap: snap}})
+	want, _, _ := planRouting([]tailnetState{{owner: "a", primary: true, snap: ipnlocal.RoutingSnapshot{
 		State:      ipn.Running,
 		Self:       prefixes("100.64.0.1/32"),
 		Peers:      prefixes("100.64.0.2/32"),

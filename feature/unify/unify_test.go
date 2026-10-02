@@ -846,6 +846,65 @@ func TestExitExclusive(t *testing.T) {
 	h.waitRouter("b's LocalRoutes", func(c *router.Config) bool { return slices.Equal(c.LocalRoutes, captured.LocalRoutes) })
 }
 
+// C1: while one tailnet uses an exit node, this node is no other tailnet's
+// exit node, as stock tailscaled refuses to both offer and use one.
+// Otherwise b's exit clients' internet traffic would reach the host, be
+// routed into the primary's exit node and leave as this node of the
+// primary's tailnet.
+func TestExitOfferExclusive(t *testing.T) {
+	h := mustHarness(t, nil)
+	h.start()
+	p, b := h.stack(PrimaryName), h.stack("b")
+	offer := running(selfPfx, peerPfx, nil)
+	offer.OffersExit = true
+	b.set(offer, nil)
+	h.waitRouter("b's routes", func(c *router.Config) bool { return len(c.LocalAddrs) == 2 })
+
+	// b's exit client, its peer, sends a packet to the internet.
+	bPeer := mpa("100.64.0.1") // b synced first: identity mapped
+	internet := mpa("8.8.8.8")
+	inbound := func() xlate.Result {
+		var q packet.Parsed
+		q.Decode(echoReq(bPeer, internet))
+		return h.u.tr.Inbound("b", &q)
+	}
+	if r := inbound(); r.Verdict != xlate.ToHost {
+		t.Fatalf("b's exit client to the internet, no exit in use: %+v, want to-host", r)
+	}
+
+	// The primary uses an exit node: b's exit clients fail closed.
+	use := running(selfPfx, peerPfx, nil)
+	use.UsesExit = true
+	p.set(use, nil)
+	h.waitRouter("primary's exit", func(c *router.Config) bool { return hasAll(c.Routes, tsaddr.AllIPv4(), tsaddr.AllIPv6()) })
+	if r := inbound(); r.Verdict != xlate.Drop || r.Reason != xlate.DropDestinationNotReachable {
+		t.Fatalf("b's exit client to the internet, primary using an exit: %+v, want drop: %v", r, xlate.DropDestinationNotReachable)
+	}
+	// Through the loop too: the packet from b's stack never reaches the
+	// host.
+	before := h.u.loop.stats()
+	if _, err := b.dev().Write([][]byte{echoReq(bPeer, internet)}, 0); err != nil {
+		t.Fatal(err)
+	}
+	h.waitFor("inbound drop", func() bool { return h.u.loop.stats().inDropped > before.inDropped })
+	if after := h.u.loop.stats(); after.toHost != before.toHost {
+		t.Errorf("b's exit client reached the host: stats %+v after %+v", after, before)
+	}
+	h.waitFor("warning", func() bool { return h.logs.count(`not offering this node as an exit node in [b]`) == 1 })
+
+	// The warning is not repeated while nothing changes.
+	p.set(use, &router.Config{NewMTU: 1280})
+	h.waitRouter("mtu", func(c *router.Config) bool { return c.NewMTU == 1280 })
+	if n := h.logs.count("not offering this node as an exit node"); n != 1 {
+		t.Errorf("offer warning logged %d times", n)
+	}
+
+	// b is an exit node again once the primary stops using one.
+	use.UsesExit = false
+	p.set(use, nil)
+	h.waitFor("b's offer back", func() bool { return inbound().Verdict == xlate.ToHost })
+}
+
 func TestHostRouterSetError(t *testing.T) {
 	h := mustHarness(t, nil)
 	h.router.setError(errors.New("netlink exploded"))

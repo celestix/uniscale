@@ -235,9 +235,10 @@ type Unify struct {
 	closeErr  error
 
 	// Owned by the worker (and by Start before it runs it).
-	applied     *router.Config // last configuration the host router accepted
-	exitIgnored []remap.Owner  // last tailnets whose exit node was not used
-	local       []netip.Prefix // last networks given to SetLocal
+	applied      *router.Config // last configuration the host router accepted
+	exitIgnored  []remap.Owner  // last tailnets whose exit node was not used
+	offerIgnored []remap.Owner  // last tailnets this node was not an exit node of
+	local        []netip.Prefix // last networks given to SetLocal
 }
 
 // New builds a stack for every tailnet and the packet loop between them
@@ -572,11 +573,17 @@ func (u *Unify) reconcile() {
 	for i, t := range u.tailnets {
 		in[i] = tailnetState{owner: t.owner, primary: t.primary, snap: t.st.RoutingSnapshot()}
 	}
-	plans, exitIgnored := planRouting(in)
+	plans, exitIgnored, offerIgnored := planRouting(in)
 	if !slices.Equal(exitIgnored, u.exitIgnored) {
 		u.exitIgnored = exitIgnored
 		if len(exitIgnored) > 0 {
 			u.logf("unify: warning: only one tailnet's exit node can be used; ignoring the exit node of %v", exitIgnored)
+		}
+	}
+	if !slices.Equal(offerIgnored, u.offerIgnored) {
+		u.offerIgnored = offerIgnored
+		if len(offerIgnored) > 0 {
+			u.logf("unify: warning: this node uses an exit node, so it cannot be one; not offering this node as an exit node in %v", offerIgnored)
 		}
 	}
 

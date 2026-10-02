@@ -47,18 +47,26 @@ type tailnetRouting struct {
 }
 
 // planRouting returns what each tailnet in ts, in configured order,
-// contributes to the host's routing, and the tailnets whose exit node is
-// not used because an earlier tailnet's is.
+// contributes to the host's routing; the tailnets whose exit node is not
+// used because an earlier tailnet's is; and the tailnets for which this
+// node is not an exit node because another tailnet's exit node is used.
 //
 // A subnet route that overlaps one this node advertises to the same
 // tailnet is left out: the host reaches that network directly, and
 // replies from it must not be taken for the tailnet's (as with high
 // availability subnet routers advertising the same LAN). Only the first
-// running tailnet using an exit node keeps it. The primary tailnet serves
-// quad-100 while it is running.
-func planRouting(ts []tailnetState) (plans []tailnetRouting, exitIgnored []remap.Owner) {
-	exitTaken, quad100Taken := false, false
-	for _, t := range ts {
+// running tailnet using an exit node keeps it. While one does, no other
+// running tailnet may use this node as its exit node: those exit clients'
+// internet traffic would leave through the used exit node, as this node
+// of another tailnet. Stock tailscaled likewise refuses to both offer and
+// use an exit node. The primary tailnet serves quad-100 while it is
+// running.
+func planRouting(ts []tailnetState) (plans []tailnetRouting, exitIgnored, offerIgnored []remap.Owner) {
+	exitUser := slices.IndexFunc(ts, func(t tailnetState) bool {
+		return t.snap.State == ipn.Running && t.snap.UsesExit
+	})
+	quad100Taken := false
+	for i, t := range ts {
 		r := tailnetRouting{owner: t.owner}
 		s := t.snap
 		if s.State != ipn.Running {
@@ -66,11 +74,14 @@ func planRouting(ts []tailnetState) (plans []tailnetRouting, exitIgnored []remap
 			continue
 		}
 		subnets := withoutOverlaps(s.Subnets, s.Advertised)
-		usesExit := s.UsesExit && !exitTaken
-		if s.UsesExit && exitTaken {
+		usesExit := i == exitUser
+		if s.UsesExit && !usesExit {
 			exitIgnored = append(exitIgnored, t.owner)
 		}
-		exitTaken = exitTaken || usesExit
+		offersExit := s.OffersExit && (exitUser < 0 || usesExit)
+		if s.OffersExit && !offersExit {
+			offerIgnored = append(offerIgnored, t.owner)
+		}
 		quad100 := t.primary && !quad100Taken
 		quad100Taken = quad100Taken || quad100
 
@@ -80,7 +91,7 @@ func planRouting(ts []tailnetState) (plans []tailnetRouting, exitIgnored []remap
 			Owner:      t.owner,
 			Self:       prefixAddrs(s.Self),
 			Advertised: slices.Clone(s.Advertised),
-			OffersExit: s.OffersExit,
+			OffersExit: offersExit,
 			UsesExit:   usesExit,
 			Quad100:    quad100,
 		}
@@ -94,7 +105,7 @@ func planRouting(ts []tailnetState) (plans []tailnetRouting, exitIgnored []remap
 		}
 		plans = append(plans, r)
 	}
-	return plans, exitIgnored
+	return plans, exitIgnored, offerIgnored
 }
 
 // withoutOverlaps returns the prefixes of ps that overlap none of drop,
