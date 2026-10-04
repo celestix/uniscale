@@ -507,7 +507,7 @@ func TestIntegration(t *testing.T) {
 	wantAddrs := sortedPrefixes(vSelfA, vSelfB)
 	wantRoutes := sortedPrefixes(vPeerA, vPeerB, quad100)
 	// Each tailnet's peers prefer its virtual self of their family as
-	// source (spec section 5, outbound step 1), quad-100 the primary's.
+	// source (so applications need no source binding), quad-100 the primary's.
 	wantSources := make(map[netip.Prefix]netip.Addr)
 	for _, c := range []struct{ routes, self []netip.Prefix }{
 		{vPeerA, vSelfA}, {vPeerB, vSelfB}, {quad100, vSelfA},

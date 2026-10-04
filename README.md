@@ -56,8 +56,16 @@ sudo uniscale --socket=/run/uniscale/uniscaled-work.sock up       # "work"
 sudo uniscale --socket=/run/uniscale/uniscaled-friends.sock up    # "friends"
 ```
 
-The design, and the current limitations, are in
-[docs/specs/2026-10-01-tailnet-unification-design.md](docs/specs/2026-10-01-tailnet-unification-design.md).
+Current limitations:
+
+- Each tailnet has its own LocalAPI socket; `uniscale status` shows one
+  tailnet at a time.
+- MagicDNS answers for the primary tailnet only, with untranslated
+  addresses.
+- While one tailnet uses an exit node, the others cannot use or offer one.
+- If one tailnet fails to start, the daemon stops.
+- State encryption and hardware attestation are not supported with
+  `--unify`.
 
 ---
 
