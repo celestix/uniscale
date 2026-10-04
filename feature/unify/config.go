@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // PrimaryName is the name of the primary tailnet. It uses tailscaled's
@@ -65,12 +66,16 @@ func TailnetDir(stateDir, name string) string {
 
 // TailnetSocket returns the LocalAPI socket path of tailnet name, other
 // than the primary, given mainSocket, tailscaled's --socket: the file
-// tailscaled-<name>.sock next to it, or "" if mainSocket is "".
+// <base>-<name>.sock next to it, where <base> is mainSocket's file name
+// without its extension (tailscaled-work.sock next to tailscaled.sock,
+// uniscaled-work.sock next to uniscaled.sock), or "" if mainSocket is "".
 func TailnetSocket(mainSocket, name string) string {
 	if mainSocket == "" {
 		return ""
 	}
-	return filepath.Join(filepath.Dir(mainSocket), "tailscaled-"+name+".sock")
+	base := filepath.Base(mainSocket)
+	base = strings.TrimSuffix(base, filepath.Ext(base))
+	return filepath.Join(filepath.Dir(mainSocket), base+"-"+name+".sock")
 }
 
 // CheckName reports whether name is a valid name for a tailnet in

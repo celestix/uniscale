@@ -273,6 +273,9 @@ func TestPaths(t *testing.T) {
 		{TailnetSocket("/var/run/tailscale/tailscaled.sock", "work"), "/var/run/tailscale/tailscaled-work.sock"},
 		{TailnetSocket("tailscaled.sock", "home"), "tailscaled-home.sock"},
 		{TailnetSocket("", "work"), ""},
+		{TailnetSocket("/var/run/uniscale/uniscaled.sock", "work"), "/var/run/uniscale/uniscaled-work.sock"},
+		{TailnetSocket("/var/run/uniscaled.socket", "work"), "/var/run/uniscaled-work.sock"},
+		{TailnetSocket("/srv/ctl", "home"), "/srv/ctl-home.sock"},
 	} {
 		if c.got != filepath.FromSlash(c.want) {
 			t.Errorf("got %q, want %q", c.got, c.want)

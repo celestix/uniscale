@@ -85,6 +85,17 @@ unify-cover: ## Fail if a feature/unify package fails its tests or is under UNIF
 		{ print; bad = 1 } \
 		END { exit bad }' && exit $$status
 
+UNISCALE_OUT ?= bin
+uniscale: ## Build the Uniscale daemon and CLI (uniscaled, uniscale) into UNISCALE_OUT (default bin)
+	./tool/go build -o $(UNISCALE_OUT)/uniscaled ./cmd/tailscaled
+	./tool/go build -o $(UNISCALE_OUT)/uniscale ./cmd/tailscale
+
+install-uniscale: uniscale ## Install Uniscale's binaries and systemd unit under DESTDIR (run as root); keeps an existing /etc/default/uniscaled
+	install -Dm755 $(UNISCALE_OUT)/uniscaled $(DESTDIR)/usr/sbin/uniscaled
+	install -Dm755 $(UNISCALE_OUT)/uniscale $(DESTDIR)/usr/bin/uniscale
+	install -Dm644 cmd/tailscaled/uniscaled.service $(DESTDIR)/etc/systemd/system/uniscaled.service
+	test -e $(DESTDIR)/etc/default/uniscaled || install -Dm644 cmd/tailscaled/uniscaled.defaults $(DESTDIR)/etc/default/uniscaled
+
 kube-generate-all: kube-generate-deepcopy ## Refresh generated files for Tailscale Kubernetes Operator
 	./tool/go generate ./cmd/k8s-operator
 

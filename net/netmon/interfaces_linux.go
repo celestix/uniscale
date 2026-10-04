@@ -226,6 +226,7 @@ func defaultRouteInterfaceProcNetInternal(bufsize int) (string, error) {
 		netmask := fields[7]
 
 		if strings.HasPrefix(ifc, "tailscale") ||
+			strings.HasPrefix(ifc, "uniscale") ||
 			strings.HasPrefix(ifc, "wg") {
 			continue
 		}

@@ -83,7 +83,7 @@ func runVersion(ctx context.Context, args []string) error {
 	}
 
 	if st == nil {
-		outln(version.String())
+		outln("uniscale " + version.String())
 		if versionArgs.upstream {
 			printf("  upstream: %s\n", upstreamVer)
 		}

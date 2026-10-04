@@ -1724,8 +1724,8 @@ func TestDocs(t *testing.T) {
 		name := t.Name()
 		wantPfx := strings.ReplaceAll(strings.TrimPrefix(name, "TestDocs/"), "/", " ")
 		switch name {
-		case "TestDocs/tailscale/completion/bash",
-			"TestDocs/tailscale/completion/zsh":
+		case "TestDocs/" + root.Name + "/completion/bash",
+			"TestDocs/" + root.Name + "/completion/zsh":
 			wantPfx = "" // special-case exceptions
 		}
 		if !strings.HasPrefix(c.ShortUsage, wantPfx) {

@@ -1,0 +1,24 @@
+[Unit]
+Description=Uniscale node agent (several Tailscale tailnets at once)
+Documentation=https://tailscale.com/docs/
+Wants=network-pre.target
+After=network-pre.target NetworkManager.service systemd-resolved.service
+Conflicts=tailscaled.service
+
+[Service]
+EnvironmentFile=-/etc/default/uniscaled
+ExecStart=/usr/sbin/uniscaled --state=/var/lib/uniscale/uniscaled.state --socket=/run/uniscale/uniscaled.sock --port=${PORT} $FLAGS
+ExecStopPost=/usr/sbin/uniscaled --cleanup
+
+Restart=on-failure
+
+RuntimeDirectory=uniscale
+RuntimeDirectoryMode=0755
+StateDirectory=uniscale
+StateDirectoryMode=0700
+CacheDirectory=uniscale
+CacheDirectoryMode=0750
+Type=notify
+
+[Install]
+WantedBy=multi-user.target

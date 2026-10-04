@@ -577,7 +577,8 @@ func isTailscaleInterface(name string, ips []netip.Prefix) bool {
 
 	// Windows, Linux...
 	return name == "Tailscale" || // as it is on Windows
-		strings.HasPrefix(name, "tailscale") // TODO: use --tun flag value, etc; see TODO in method doc
+		strings.HasPrefix(name, "tailscale") || // TODO: use --tun flag value, etc; see TODO in method doc
+		strings.HasPrefix(name, "uniscale") // Uniscale's default, uniscale0
 }
 
 // getPAC, if non-nil, returns the current PAC file URL.

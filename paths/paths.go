@@ -57,7 +57,7 @@ func DefaultTailscaledSocket() string {
 		return WindowsProtectedPipePrefix + `Tailscale\tailscaled`
 	}
 	if runtime.GOOS == "darwin" {
-		return "/var/run/tailscaled.socket"
+		return "/var/run/uniscaled.socket"
 	}
 	if runtime.GOOS == "plan9" {
 		return "/srv/tailscaled.sock"
@@ -83,9 +83,9 @@ func DefaultTailscaledSocket() string {
 		return "/tmp/tailscale/tailscaled.sock"
 	}
 	if fi, err := os.Stat("/var/run"); err == nil && fi.IsDir() {
-		return "/var/run/tailscale/tailscaled.sock"
+		return "/var/run/uniscale/uniscaled.sock"
 	}
-	return "tailscaled.sock"
+	return "uniscaled.sock"
 }
 
 // Overridden in init by OS-specific files.

@@ -101,7 +101,7 @@ func defaultTunName() string {
 			return "userspace-networking"
 		}
 	}
-	return "tailscale0"
+	return "uniscale0"
 }
 
 // defaultPort returns the default UDP port to listen on for disco+wireguard.
@@ -165,14 +165,22 @@ var beCLI func() // non-nil if CLI is linked in with the "ts_include_cli" build 
 // shouldRunCLI reports whether we should run the Tailscale CLI (cmd/tailscale)
 // instead of the daemon (cmd/tailscaled) in the case when the two are linked
 // together into one binary for space savings reasons.
+// daemonVersion returns what --version prints: the daemon's name and
+// version.
+func daemonVersion() string {
+	return "uniscaled " + version.String()
+}
+
 func shouldRunCLI() bool {
 	if beCLI == nil {
 		// Not linked in with the "ts_include_cli" build tag.
 		return false
 	}
-	if len(os.Args) > 0 && filepath.Base(os.Args[0]) == "tailscale" {
-		// The binary was named (or hardlinked) as "tailscale".
-		return true
+	if len(os.Args) > 0 {
+		if name := filepath.Base(os.Args[0]); name == "uniscale" || name == "tailscale" {
+			// The binary was named (or hardlinked) as the CLI.
+			return true
+		}
 	}
 	if envknob.Bool("TS_BE_CLI") {
 		// The environment variable was set to force it.
@@ -284,7 +292,7 @@ store state on filesystem.`)
 	}
 
 	if printVersion {
-		fmt.Println(version.String())
+		fmt.Println(daemonVersion())
 		os.Exit(0)
 	}
 
@@ -456,7 +464,7 @@ func ipnServerOpts() (o serverOptions) {
 	// If an absolute --state is provided but not --statedir, try to derive
 	// a state directory.
 	if o.VarRoot == "" && filepath.IsAbs(args.statepath) {
-		if dir := filepath.Dir(args.statepath); strings.EqualFold(filepath.Base(dir), "tailscale") {
+		if dir := filepath.Dir(args.statepath); strings.EqualFold(filepath.Base(dir), "uniscale") || strings.EqualFold(filepath.Base(dir), "tailscale") {
 			o.VarRoot = dir
 		}
 	}

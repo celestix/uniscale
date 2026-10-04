@@ -26,13 +26,13 @@ func statePath() string {
 	}
 	switch runtime.GOOS {
 	case "linux", "illumos", "solaris":
-		return "/var/lib/tailscale/tailscaled.state"
+		return "/var/lib/uniscale/uniscaled.state"
 	case "freebsd", "openbsd":
-		return "/var/db/tailscale/tailscaled.state"
+		return "/var/db/uniscale/uniscaled.state"
 	case "darwin":
-		return "/Library/Tailscale/tailscaled.state"
+		return "/Library/Uniscale/uniscaled.state"
 	case "aix":
-		return "/var/tailscale/tailscaled.state"
+		return "/var/uniscale/uniscaled.state"
 	default:
 		return ""
 	}
@@ -48,7 +48,7 @@ func stateFileUnix() string {
 	}
 
 	try := path
-	for range 3 { // check writability of the file, /var/lib/tailscale, and /var/lib
+	for range 3 { // check writability of the file, /var/lib/uniscale, and /var/lib
 		err := unix.Access(try, unix.O_RDWR)
 		if err == nil {
 			return path
@@ -60,8 +60,8 @@ func stateFileUnix() string {
 		return ""
 	}
 
-	// For non-root users, fall back to $XDG_DATA_HOME/tailscale/*.
-	return filepath.Join(xdgDataHome(), "tailscale", "tailscaled.state")
+	// For non-root users, fall back to $XDG_DATA_HOME/uniscale/*.
+	return filepath.Join(xdgDataHome(), "uniscale", "uniscaled.state")
 }
 
 func xdgDataHome() string {
@@ -72,7 +72,7 @@ func xdgDataHome() string {
 }
 
 func ensureStateDirPermsUnix(dir string) error {
-	if filepath.Base(dir) != "tailscale" {
+	if base := filepath.Base(dir); base != "uniscale" && base != "tailscale" {
 		return nil
 	}
 	fi, err := os.Stat(dir)

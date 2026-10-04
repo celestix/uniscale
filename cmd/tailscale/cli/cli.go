@@ -262,11 +262,14 @@ func newRootCmd(tb ...testenv.TB) *ffcli.Command {
 
 	var rootCmd *ffcli.Command
 	rootCmd = &ffcli.Command{
-		Name:       "tailscale",
-		ShortUsage: "tailscale [flags] <subcommand> [command flags]",
-		ShortHelp:  "The easiest, most secure way to use WireGuard.",
+		Name:       "uniscale",
+		ShortUsage: "uniscale [flags] <subcommand> [command flags]",
+		ShortHelp:  "Run several Tailscale tailnets at once, as one network.",
 		LongHelp: strings.TrimSpace(`
-For help on subcommands, add --help after: "tailscale status --help".
+For help on subcommands, add --help after: "uniscale status --help".
+
+Uniscale is a fork of Tailscale that runs several tailnets at once; it is
+not affiliated with or endorsed by Tailscale Inc.
 
 This CLI is still under active development. Commands and flags will
 change in the future.
@@ -336,12 +339,31 @@ change in the future.
 	})
 
 	ffcomplete.Inject(rootCmd, func(c *ffcli.Command) { c.LongHelp = hidden + c.LongHelp }, usageFunc)
+	walkCommands(rootCmd, func(w cmdWalk) bool {
+		w.ShortUsage = cliNameUsage(w.ShortUsage)
+		return true
+	})
 	var t testenv.TB
 	if len(tb) > 0 {
 		t = tb[0]
 	}
 	noDupFlagify(rootCmd, t)
 	return rootCmd
+}
+
+// cliNameUsage returns usage with each line that starts with the CLI's
+// upstream name, tailscale, starting with uniscale instead, so subcommands'
+// usage matches the root command's without editing each one.
+func cliNameUsage(usage string) string {
+	lines := strings.Split(usage, "\n")
+	for i, line := range lines {
+		if rest, ok := strings.CutPrefix(line, "tailscale "); ok {
+			lines[i] = "uniscale " + rest
+		} else if line == "tailscale" {
+			lines[i] = "uniscale"
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func nonNilCmds(cmds ...*ffcli.Command) []*ffcli.Command {

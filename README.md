@@ -1,3 +1,68 @@
+# Uniscale
+
+Run several Tailscale tailnets at once, as one network.
+
+Uniscale is a fork of [Tailscale](https://github.com/tailscale/tailscale)
+whose daemon, `uniscaled`, joins your work, personal and friends' tailnets
+at the same time. Each tailnet runs in its own stack, with its own node
+identity, ACLs and login. The host sees one network: where two tailnets
+(or a tailnet and your LAN) use the same addresses, Uniscale remaps the
+colliding ones into a shared address space (198.18.0.0/15 and a ULA /48),
+so every peer stays reachable and the other ends see you as usual.
+
+Uniscale is not affiliated with or endorsed by Tailscale Inc.
+"Tailscale" is a trademark of Tailscale Inc.
+
+## Differences from Tailscale
+
+| | Tailscale | Uniscale |
+|---|---|---|
+| Daemon / CLI | `tailscaled` / `tailscale` | `uniscaled` / `uniscale` |
+| State | `/var/lib/tailscale` | `/var/lib/uniscale` |
+| LocalAPI socket | `/run/tailscale/tailscaled.sock` | `/run/uniscale/uniscaled.sock` |
+| TUN device | `tailscale0` | `uniscale0` |
+| systemd unit | `tailscaled.service` | `uniscaled.service` |
+| Several tailnets | no | `uniscaled --unify` |
+
+Uniscale can be installed next to Tailscale without touching its state,
+but only one of them can run at a time (they use the same routing table).
+When `controlplane.tailscale.com` is unreachable, Uniscale logs in through
+`login.tailscale.com`, the same control plane.
+
+## Building and installing (Linux)
+
+```sh
+make uniscale                 # builds bin/uniscaled and bin/uniscale
+sudo make install-uniscale    # /usr/sbin/uniscaled, /usr/bin/uniscale, uniscaled.service
+sudo systemctl disable --now tailscaled   # if Tailscale is installed
+```
+
+## Running several tailnets
+
+List the tailnets besides the primary one in
+`/var/lib/uniscale/unify/config.json`:
+
+```json
+{"tailnets": [{"name": "work"}, {"name": "friends"}]}
+```
+
+Add `--unify` to `FLAGS` in `/etc/default/uniscaled`, start the service,
+and log in to each tailnet through its own socket:
+
+```sh
+sudo systemctl enable --now uniscaled
+sudo uniscale up                                                  # primary
+sudo uniscale --socket=/run/uniscale/uniscaled-work.sock up       # "work"
+sudo uniscale --socket=/run/uniscale/uniscaled-friends.sock up    # "friends"
+```
+
+The design, and the current limitations, are in
+[docs/specs/2026-10-01-tailnet-unification-design.md](docs/specs/2026-10-01-tailnet-unification-design.md).
+
+---
+
+The rest of this file is the upstream Tailscale README.
+
 # Tailscale
 
 https://tailscale.com
