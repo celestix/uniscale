@@ -75,8 +75,8 @@ func TestNewDirect(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if c.serverURL != opts.ServerURL {
-		t.Errorf("c.serverURL got %v want %v", c.serverURL, opts.ServerURL)
+	if got := c.serverURL.Load(); got != opts.ServerURL {
+		t.Errorf("c.serverURL got %v want %v", got, opts.ServerURL)
 	}
 
 	// hi is stored without its NetInfo field.

@@ -76,8 +76,8 @@ type Direct struct {
 	interceptedDial   *atomic.Bool // if non-nil, pointer to bool whether ScreenTime intercepted our dial
 	dialer            *tsdial.Dialer
 	dnsCache          *dnscache.Resolver
-	controlKnobs      *controlknobs.Knobs // always non-nil
-	serverURL         string              // URL of the tailcontrol server
+	controlKnobs      *controlknobs.Knobs       // always non-nil
+	serverURL         syncs.AtomicValue[string] // URL of the tailcontrol server; may switch to a fallback, see fetchServerPubKeys
 	clock             tstime.Clock
 	logf              logger.Logf
 	netMon            *netmon.Monitor // non-nil
@@ -371,7 +371,6 @@ func NewDirect(opts Options) (*Direct, error) {
 		interceptedDial:   interceptedDial,
 		controlKnobs:      opts.ControlKnobs,
 		getMachinePrivKey: opts.GetMachinePrivateKey,
-		serverURL:         opts.ServerURL,
 		clock:             opts.Clock,
 		logf:              opts.Logf,
 		persist:           opts.Persist.View(),
@@ -393,6 +392,7 @@ func NewDirect(opts Options) (*Direct, error) {
 
 	c.controlClientID = nextControlClientID.Add(1)
 
+	c.serverURL.Store(opts.ServerURL)
 	if opts.Hostinfo == nil {
 		c.SetHostinfo(hostinfo.New())
 	} else {
@@ -516,8 +516,8 @@ func (c *Direct) TryLogout(ctx context.Context) error {
 }
 
 func (c *Direct) TryLogin(ctx context.Context, flags LoginFlags) (url string, err error) {
-	if strings.Contains(c.serverURL, "controlplane.tailscale.com") && envknob.Bool("TS_PANIC_IF_HIT_MAIN_CONTROL") {
-		panic(fmt.Sprintf("[unexpected] controlclient: TryLogin called on %s; tainted=%v", c.serverURL, c.panicOnUse))
+	if strings.Contains(c.serverURL.Load(), "controlplane.tailscale.com") && envknob.Bool("TS_PANIC_IF_HIT_MAIN_CONTROL") {
+		panic(fmt.Sprintf("[unexpected] controlclient: TryLogin called on %s; tainted=%v", c.serverURL.Load(), c.panicOnUse))
 	}
 	c.logf("[v1] direct.TryLogin(flags=%v)", flags)
 	return c.doLoginOrRegen(ctx, loginOpt{Flags: flags})
@@ -673,7 +673,7 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 
 	c.logf("doLogin(regen=%v, hasUrl=%v)", regen, opt.URL != "")
 	if serverKey.IsZero() {
-		keys, err := loadServerPubKeys(ctx, c.httpc, c.serverURL)
+		keys, err := c.fetchServerPubKeys(ctx)
 		if err != nil && c.interceptedDial != nil && c.interceptedDial.Load() {
 			c.health.SetUnhealthy(macOSScreenTime, nil)
 		} else {
@@ -682,7 +682,7 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 		if err != nil {
 			return regen, opt.URL, nil, err
 		}
-		c.logf("control server key from %s: ts2021=%s, legacy=%v", c.serverURL, keys.PublicKey.ShortString(), keys.LegacyPublicKey.ShortString())
+		c.logf("control server key from %s: ts2021=%s, legacy=%v", c.serverURL.Load(), keys.PublicKey.ShortString(), keys.LegacyPublicKey.ShortString())
 
 		c.mu.Lock()
 		c.serverLegacyKey = keys.LegacyPublicKey
@@ -781,7 +781,7 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 			AuthKey: authKey,
 		}
 	}
-	err = signRegisterRequest(c.polc, &request, c.serverURL, c.serverLegacyKey, machinePrivKey.Public())
+	err = signRegisterRequest(c.polc, &request, c.serverURL.Load(), c.serverLegacyKey, machinePrivKey.Public())
 	if err != nil {
 		// If signing failed, clear all related fields
 		request.SignatureType = tailcfg.SignatureNone
@@ -807,7 +807,7 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 	if err != nil {
 		return regen, opt.URL, nil, fmt.Errorf("getNoiseClient: %w", err)
 	}
-	url := fmt.Sprintf("%s/machine/register", c.serverURL)
+	url := fmt.Sprintf("%s/machine/register", c.serverURL.Load())
 	url = strings.Replace(url, "http:", "https:", 1)
 
 	bodyData, err := encode(request)
@@ -1042,7 +1042,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 
 	c.mu.Lock()
 	persist := c.persist
-	serverURL := c.serverURL
+	serverURL := c.serverURL.Load()
 	serverNoiseKey := c.serverNoiseKey
 	discoKey := c.discoPubKey
 	hi := c.hostInfoLocked()
@@ -1540,7 +1540,7 @@ func loadServerPubKeys(ctx context.Context, httpc *http.Client, serverURL string
 	}
 	res, err := httpc.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch control key: %v", err)
+		return nil, fmt.Errorf("fetch control key: %w", err)
 	}
 	defer res.Body.Close()
 	httpbody.LimitSizeTo(res, 64<<10)
@@ -1730,7 +1730,7 @@ func (c *Direct) getNoiseClient() (*ts2021.Client, error) {
 		nc, err := ts2021.NewClient(ts2021.ClientOpts{
 			PrivKey:       k,
 			ServerPubKey:  serverNoiseKey,
-			ServerURL:     c.serverURL,
+			ServerURL:     c.serverURL.Load(),
 			Dialer:        c.dialer,
 			DNSCache:      c.dnsCache,
 			Logf:          c.logf,
